@@ -1,4 +1,4 @@
-# TipOS v0.7.5.0
+# TipOS v0.7.6.0
 
 Sistema operacional x86-64 com kernel OvsbMk, libc própria, compositor gráfico,
 editor TUI e suporte a execução de binários **musl-linked static PIE ELF**
