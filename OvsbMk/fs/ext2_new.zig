@@ -110,6 +110,14 @@ const DirEntry = extern struct {
     inline fn minSize() u32 { return 8; }
 };
 
+const VfsDirent = extern struct {
+    ino: u64,
+    next_cookie: u64,
+    file_type: u8,
+    name_len: u16,
+    name: [256]u8,
+};
+
 // ===== Block cache =====
 
 const CacheSlot = struct {
@@ -415,7 +423,7 @@ pub fn readFile(path: []const u8, buf: []u8) !usize {
     return to_read;
 }
 
-pub fn readFileAt(path: []const u8, buf: []u8, offset: u32) !usize {
+pub fn readFileAt(path: []const u8, buf: []u8, offset: u64) !usize {
     const ino = try resolve(path);
     const inode = readIno(ino);
     if (!inode.isReg()) return error.NotAFile;
@@ -449,7 +457,49 @@ pub fn statPath(path: []const u8) !struct { size: u32, is_dir: bool } {
     return .{ .size = inode.fileSize(), .is_dir = inode.isDir() };
 }
 
-pub fn writeFile(path: []const u8, data: []const u8, offset: u32) !usize {
+fn linuxDirentType(file_type: u8) u8 {
+    return switch (file_type) {
+        1 => 8,
+        2 => 4,
+        7 => 10,
+        else => 0,
+    };
+}
+
+fn readdirPath(path: []const u8, cookie: u64, entries: []VfsDirent) !usize {
+    const dir_ino = try resolve(path);
+    const dir_inode = readIno(dir_ino);
+    if (!dir_inode.isDir()) return error.NotADir;
+
+    var off: u32 = @intCast(@min(cookie, @as(u64, dir_inode.fileSize())));
+    var count: usize = 0;
+    while (off < dir_inode.fileSize() and count < entries.len) {
+        const logical: u32 = @intCast(off / BLOCK_SIZE);
+        const in_off: usize = @intCast(off % BLOCK_SIZE);
+        const phys = bmapRead(&dir_inode, logical) orelse return error.Io;
+        const block = cacheGet(phys);
+        const de: *const DirEntry = @ptrCast(@alignCast(block[in_off..].ptr));
+        if (de.rec_len < 8 or de.rec_len > BLOCK_SIZE - in_off)
+            return error.Io;
+        const next = off + de.rec_len;
+        if (de.inode != 0 and de.name_len != 0 and de.name_len <= 255) {
+            const out = &entries[count];
+            const copy_len: usize = @min(@as(usize, de.name_len), out.name.len - 1);
+            const name_start = in_off + 8;
+            @memcpy(out.name[0..copy_len], block[name_start..name_start + copy_len]);
+            out.name[copy_len] = 0;
+            out.name_len = @intCast(copy_len);
+            out.ino = de.inode;
+            out.next_cookie = next;
+            out.file_type = linuxDirentType(de.file_type);
+            count += 1;
+        }
+        off = next;
+    }
+    return count;
+}
+
+pub fn writeFile(path: []const u8, data: []const u8, offset: u64) !usize {
     const ino = try resolveOrCreateFile(path);
     var inode = readIno(ino);
     const end = offset + data.len;
@@ -632,8 +682,23 @@ export fn ext2new_stat(path: [*:0]const u8, out_size: *u32, out_is_dir: *bool) i
     return 0;
 }
 
-export fn ext2new_read_at(path: [*:0]const u8, buf: [*]u8, size: u32, offset: u32) i32 {
+export fn ext2new_readdir(path: [*:0]const u8, cookie: u64,
+                          entries: [*]VfsDirent, capacity: u32) i32 {
+    if (!fs_ready or capacity == 0) return ERR_NOTMOUNTED;
+    const result = readdirPath(path[0..std.mem.len(path)], cookie,
+                               entries[0..capacity]) catch |err| {
+        return switch (err) {
+            error.NotFound => ERR_NOTFOUND,
+            error.NotADir => -20,
+            else => ERR_IO,
+        };
+    };
+    return @intCast(result);
+}
+
+export fn ext2new_read_at(path: [*:0]const u8, buf: [*]u8, size: u32, offset: u64) i32 {
     if (!fs_ready) return ERR_NOTMOUNTED;
+    if (offset > 0xFFFF_FFFF) return ERR_IO;
     const r = readFileAt(path[0..std.mem.len(path)], buf[0..size], offset) catch {
         serial_puts("[E2RD] fail path=");
         serial_puts(path);
@@ -643,8 +708,10 @@ export fn ext2new_read_at(path: [*:0]const u8, buf: [*]u8, size: u32, offset: u3
     return @intCast(r);
 }
 
-export fn ext2new_write_file(path: [*:0]const u8, data: [*]const u8, size: u32, offset: u32) i32 {
+export fn ext2new_write_file(path: [*:0]const u8, data: [*]const u8, size: u32, offset: u64) i32 {
     if (!fs_ready) return ERR_NOTMOUNTED;
+    if (offset > 0xFFFF_FFFF or @as(u64, size) > 0xFFFF_FFFF - offset)
+        return ERR_IO;
     const r = writeFile(path[0..std.mem.len(path)], data[0..size], offset) catch |err| {
         return switch (err) {
             error.NoSpace => ERR_NOSPACE,

@@ -76,6 +76,8 @@ int fat32_init(void);
 int fat32_create_file(const char *name);
 int fat32_delete_file(const char *name);
 int fat32_read_file(const char *name, uint8_t *buffer, uint32_t size);
+int fat32_read_at(const char *name, uint8_t *buffer, uint32_t size, uint64_t offset);
+int fat32_write_at(const char *name, const uint8_t *buffer, uint32_t size, uint64_t offset);
 int fat32_write_file(const char *name, const uint8_t *buffer, uint32_t size);
 int fat32_list_dir(void);
 
@@ -90,15 +92,26 @@ int fat32_rmdir(const char *name);
 int fat32_stat(const char *name, uint32_t *size, uint8_t *attr,
                uint16_t *mtime, uint16_t *mdate);
 void fat32_sync(void);
+int fat32_truncate(const char *name, uint32_t new_size);
 
 typedef struct {
     char name[64];
     uint8_t attr;
 } fat32_dirent_t;
 
+typedef struct {
+    uint64_t ino;
+    uint64_t next_cookie;
+    uint8_t type;
+    uint16_t name_len;
+    char name[256];
+} fat32_vfs_dirent_t;
+
 /* ~~ fat32_match_prefix ~~ */
 int fat32_match_prefix(const char *prefix, uint32_t dir_cluster,
                        fat32_dirent_t *entries, int max_entries);
+int fat32_readdir(const char *path, uint64_t cookie,
+                  fat32_vfs_dirent_t *entries, uint32_t capacity);
 
 #endif
 

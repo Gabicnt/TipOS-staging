@@ -150,6 +150,7 @@ syscall_isr:
 ;   Acredite, 3 horas de debug nisso (experiência própria)~ >_<
 global irq0
 extern timer_tick_handler
+extern timer_ticks
 irq0:
     ; Only call timer_tick_handler (which may schedule) if we came from
     ; user mode (ring 3). If we came from kernel mode (ring 0), just
@@ -160,11 +161,12 @@ irq0:
     ; iretq expects.
     test byte [rsp+8], 3   ; Check CS.RPL: [rsp] = RIP, [rsp+8] = CS
     jnz .from_user
-    ; From ring 0: send EOI to master PIC, then return.
+    ; From ring 0: advance time and send EOI, but never switch context.
     ; Se nao mandar EOI, o PIC fica esperando e NENHUMA outra IRQ
     ; (incluindo teclado e mouse) vai ser entregue. O usuario fica
     ; puto e o mouse vira enfeite. trust me, 3 horas de debug nisso.
     push rax
+    inc qword [rel timer_ticks]
     mov al, 0x20
     out 0x20, al
     pop rax
@@ -191,6 +193,7 @@ irq0:
     ; call chain. context_switch uses RBX to save kernel_rsp.
     mov rbx, rsp
     cld
+    mov rdi, rsp
     call timer_tick_handler
     pop r15
     pop r14

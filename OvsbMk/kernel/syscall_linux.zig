@@ -30,7 +30,7 @@ pub const linux = struct {
     pub const fork = 57;
     pub const execve = 59;
     pub const _exit = 60;
-    pub const getdents64 = 78;
+    pub const getdents64 = 217;
     pub const getcwd = 79;
     pub const chdir = 80;
     pub const mkdir = 83;
@@ -170,6 +170,9 @@ pub const linux = struct {
 
     // CPU affinity
     pub const getcpu = 309;
+
+    // memfd
+    pub const memfd_create = 319;
 };
 
 // ~~ Syscalls TipOS ~~
@@ -224,7 +227,10 @@ const linux_to_tipos: [512]u16 = brk: {
     map[202] = 96;    // futex (202 colide c/ mouse_read) → 96 livre
     map[234] = 103;   // tgkill (234 colide c/ nanosleep) → 103 livre
     map[334] = 334;   // rseq (livre no TipOS)
+    map[319] = 319;   // memfd_create (319 livre no TipOS, handler direto)
     map[16]  = 54;    // ioctl (stub)
+    map[17]  = 215;   // pread64
+    map[18]  = 216;   // pwrite64
     map[21]  = 33;    // access
     map[22]  = 22;    // pipe (livre no TipOS)
     map[23]  = 23;    // select (TipOS 23 = select)
@@ -249,7 +255,8 @@ const linux_to_tipos: [512]u16 = brk: {
     map[49]  = 49;    // bind (livre no TipOS)
     map[50]  = 50;    // listen (livre no TipOS)
     map[53]  = 53;    // socketpair (livre no TipOS)
-    map[54]  = 93;    // fcntl (54 colide c/ ioctl)
+    map[54]  = 52;    // setsockopt (54 -> 52 livre)
+    map[55]  = 55;    // getsockopt (55 livre)
     map[57]  = 214;   // fork REAL (issue #72)
     map[59]  = 208;   // execve
     map[60]  = 1;     // exit
@@ -259,6 +266,7 @@ const linux_to_tipos: [512]u16 = brk: {
     map[78]  = 207;   // getdents via readdir
     map[83]  = 136;   // mkdir
     map[84]  = 137;   // rmdir
+    map[86]  = 86;    // link (86 livre no TipOS — vira cópia no FAT32)
     map[87]  = 10;    // unlink
     map[96]  = 116;   // gettimeofday
     map[97]  = 97;    // getrlimit
@@ -268,6 +276,8 @@ const linux_to_tipos: [512]u16 = brk: {
     map[99]  = 401;   // sysinfo (99 colide c/ sched_setaffinity) → 401 livre
     map[102] = 24;    // getuid
     map[104] = 47;    // getgid
+    map[105] = 410;   // setuid (TipOS single-user no-op)
+    map[106] = 411;   // setgid (TipOS single-user no-op)
     map[107] = 25;    // geteuid
     map[108] = 48;    // getegid
     map[130] = 130;   // rt_sigtimedwait (livre no TipOS)
@@ -280,6 +290,7 @@ const linux_to_tipos: [512]u16 = brk: {
     map[200] = 95;    // tkill (200 colide c/ disp_get_fb)
     map[202] = 96;    // futex (202 colide c/ mouse_read)
     map[203] = 99;    // sched_setaffinity (203 colide c/ kb_mod)
+    map[217] = 207;   // getdents64 (glibc readdir)
     map[204] = 101;   // sched_getaffinity (204 colide c/ lseek)
     map[213] = 213;   // epoll_create (livre no TipOS)
     map[232] = 232;   // epoll_wait (livre no TipOS)
@@ -310,6 +321,7 @@ const linux_to_tipos: [512]u16 = brk: {
     map[296] = 296;   // prlimit64 (livre no TipOS)
     map[302] = 302;   // prlimit64 (livre no TipOS)
     map[318] = 318;   // getrandom (livre no TipOS)
+    map[270] = 270;   // pselect6 (livre no TipOS)
     map[271] = 271;   // ppoll (livre no TipOS)
     map[283] = 283;   // timerfd_create (livre no TipOS)
     map[286] = 286;   // timerfd_settime (livre no TipOS)
@@ -319,6 +331,10 @@ const linux_to_tipos: [512]u16 = brk: {
     map[332] = 332;   // statx (livre no TipOS)
     map[326] = 326;   // copy_file_range (livre no TipOS)
     map[221] = 221;   // fadvise64 (livre no TipOS)
+    map[74]  = 412;   // fsync -> 412 (74 colide c/ mprotect)
+    map[75]  = 413;   // fdatasync -> 413 (75 colide c/ mremap)
+    map[76]  = 414;   // truncate -> 414
+    map[77]  = 415;   // ftruncate -> 415
     map[231] = 212;   // ~~ exit_group ~~
                         // Linux exit_group = 231, mas brk também = 231!
                         // Colisão! Então mapeamos pra 212 (nosso exit_group).
@@ -347,7 +363,7 @@ const linux_to_tipos: [512]u16 = brk: {
 // traduz o número do syscall (Linux → TipOS se necessário),
 // ajusta o arg4 (Linux passa em r10, TipOS espera em rcx),
 // e chama o handler em C. Se o número for inválido (>= 512), retorna -1~ ☆
-extern fn syscall_trace(num: u64, rip: u64) void;
+extern fn syscall_trace(num: u64, rip: u64, path: ?[*:0]const u8) void;
 
 export fn syscall_handler_zig(regs: [*]u64) void {
     const num = regs[0];
@@ -356,9 +372,18 @@ export fn syscall_handler_zig(regs: [*]u64) void {
         return;
     }
 
-    syscall_trace(num, regs[15]);
+    const path_arg = switch (num) {
+        linux.open, linux.mkdir, linux.unlink, linux.lstat => regs[4],
+        linux.openat, linux.mkdirat, linux.newfstatat, linux.unlinkat,
+        linux.readlinkat, 266, linux.statx => regs[3],
+        else => 0,
+    };
+    syscall_trace(num, regs[15], if (path_arg == 0) null else @ptrFromInt(path_arg));
 
-    const mapped = linux_to_tipos[@as(usize, @intCast(num))];
+    var mapped = linux_to_tipos[@as(usize, @intCast(num))];
+    const tipos_native = (num == tipos.kbhit and regs[4] == 0) or
+        (num == tipos.disp_get_fb and regs[4] >= 0x10000);
+    if (tipos_native) mapped = @as(u16, @intCast(num));
     regs[0] = @as(u64, mapped);
 
     // Fix up arg4 for Linux syscalls: Linux puts arg4 in r10 (regs[7]),
@@ -366,8 +391,11 @@ export fn syscall_handler_zig(regs: [*]u64) void {
     // Only do this when the number actually changed (Linux → TipOS translation),
     // so TipOS-native calls (198-211, or identity-mapped like 186→186) keep rcx.
     // Sockets identity-mapped (socketpair=53, accept4=288) also need arg4 in rcx.
-    const is_socket = (num >= 41 and num <= 53) or num == 288;
-    if (mapped != num or is_socket) {
+    // Linux coloca o 4o arg em r10, TipOS espera em rcx.
+    // Para TODA syscall Linux (nao-tipos_native) copia r10->rcx.
+    // Sem isso pselect6/select/ppoll viam exceptfds/timeout lixo em RCX
+    // e o kernel escrevia em 0x7118F6AD (GPF) ou PF@0.
+    if (!tipos_native) {
         regs[1] = regs[7]; // r10 → rcx
     }
 

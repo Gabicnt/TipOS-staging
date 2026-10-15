@@ -51,12 +51,11 @@ void pic_init(void) {
     outb(PIC1_DATA, 0x01);     // ICW4: modo 8086
     outb(PIC2_DATA, 0x01);
     
-    // Restaurar máscaras
-    outb(PIC1_DATA, mask1);
-    outb(PIC2_DATA, mask2);
-
-    // Garantir que IRQ2 (cascade do slave) esteja desmascarada no master
-    outb(PIC1_DATA, inb(PIC1_DATA) & ~0x04);
+    // Habilita PIT (IRQ0), teclado (IRQ1), cascata (IRQ2) e mouse PS/2 (IRQ12).
+    // ~0x07 = limpa bits 0,1,2 no master; ~0x10 = bit 4 no slave.
+    // Sem o bit0 o timer nunca preempta e o Xorg trava em poll().
+    outb(PIC1_DATA, mask1 & (uint8_t)~0x07);
+    outb(PIC2_DATA, mask2 & (uint8_t)~0x10);
 }
 
 

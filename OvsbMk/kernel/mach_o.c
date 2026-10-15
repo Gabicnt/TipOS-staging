@@ -98,7 +98,7 @@ void *mach_o_load(void *data, unsigned int len) {
 /* Helper: map a 2MB virtual page in pml4 to a freshly allocated physical page.
  * Modifies pml4 page tables directly without switching CR3. */
 /* ~~ clone_identity_tables ~~
- * Clona as tabelas de paginação identity-mapped (PML4→PDP→PD do slot 0).
+ * Clona as tabelas de paginação identity-mapped usadas pelos processos.
  * Retorna o endereço físico da nova PML4, ou 0 se falhar.
  * Quem chamar pode modificar as entradas PD sem afetar a original~
  * (tipo quando você tira xerox da sua chave de casa pra dar pro
@@ -111,15 +111,15 @@ uint64_t clone_identity_tables(void) {
     uint64_t *old_pml4 = (uint64_t *)(uintptr_t)pml4_get_current();
 
     /* Allocate new PD table */
-    uint64_t *new_pd = mmap_user(0, 4096, 3, 0);
+    uint64_t *new_pd = page_frame_kernel();
     if (!new_pd) return 0;
 
     /* Allocate new PDP table */
-    uint64_t *new_pdp = mmap_user(0, 4096, 3, 0);
+    uint64_t *new_pdp = page_frame_kernel();
     if (!new_pdp) return 0;
 
     /* Allocate new PML4 */
-    uint64_t *new_pml4 = mmap_user(0, 4096, 3, 0);
+    uint64_t *new_pml4 = page_frame_kernel();
     if (!new_pml4) return 0;
 
     /* Copy identity PD entries from old PD table (PDP[0] → PD).
@@ -135,19 +135,98 @@ uint64_t clone_identity_tables(void) {
     uint64_t *old_pdp = (uint64_t *)(uintptr_t)(old_pml4[0] & ~0xFFFULL);
     uint64_t *old_pd = (uint64_t *)(uintptr_t)(old_pdp[0] & ~0xFFFULL);
     for (int i = 0; i < 512; i++) {
-        if (old_pd[i] & 0x80)
-            new_pd[i] = old_pd[i] & ~0x04ULL;
-        else
+        uint64_t pde = old_pd[i];
+        if (!(pde & 1)) {
             new_pd[i] = 0;
+            if (i == 0x12) {
+                extern void serial_puts(const char *s);
+                extern void serial_puthex(uint32_t v);
+                serial_puts("[clone-miss] pde12="); serial_puthex((uint32_t)pde);
+                serial_puts("\r\n");
+            }
+            continue;
+        }
+        if (pde & 0x80) { new_pd[i] = pde & ~0x04ULL; continue; }
+        /* ~~ PDE dividido em 4KB (split_2mb_pde do fork / vm_map) ~~
+         * Zerar a entrada deixava BURACO no identity do filho: o
+         * kmalloc do kernel acessa phys 0x24D6000 sob o CR3 novo e
+         * dava #PF em loop infinito logo depois do [execve] ok (xterm
+         * congelava — RIP=kmalloc+0x149, PD[0x12]=0). Clona a PT pro
+         * filho (frame próprio, sem compartilhar) e tira o U/S igual
+         * fazemos com os huge — execve/spawn re-marcam depois. ~~ */
+        uint64_t *old_pt = (uint64_t *)(uintptr_t)(pde & ~0xFFFULL);
+        uint64_t *new_pt = page_frame_kernel();
+        if (!new_pt) { new_pd[i] = 0; continue; }
+        for (int j = 0; j < 512; j++) new_pt[j] = old_pt[j] & ~0x04ULL;
+        new_pd[i] = ((uint64_t)(uintptr_t)new_pt) | 0x03; /* P|RW, sem U/S */
+        if (i == 0x12) {
+            extern void serial_puts(const char *s);
+            extern void serial_puthex(uint32_t v);
+            serial_puts("[clone-pt] new_pd="); serial_puthex((uint32_t)((uint64_t)new_pd >> 32));
+            serial_puthex((uint32_t)new_pd);
+            serial_puts(" new_pt="); serial_puthex((uint32_t)new_pt);
+            serial_puts(" old_pt="); serial_puthex((uint32_t)old_pt);
+            serial_puts(" slot="); serial_puthex((uint32_t)new_pd[0x12]);
+            serial_puts("\r\n");
+        }
+    }
+
+    /* ~~ debug fase 7: de onde vem buraco no identity? ~~ */
+    {
+        extern void serial_puts(const char *s);
+        extern void serial_puthex(uint32_t v);
+        uint64_t o12 = old_pd[0x12];
+        serial_puts("[clone] old_pd12="); serial_puthex((uint32_t)(o12 >> 32));
+        serial_puthex((uint32_t)o12);
+        serial_puts(" new="); serial_puthex((uint32_t)(new_pd[0x12] >> 32));
+        serial_puthex((uint32_t)new_pd[0x12]);
+        serial_puts("\r\n");
     }
 
     /* Set up new PDP: only entry 0 (identity) points to the new PD.
      * 0x07 = Present + R/W + User (U/S bit essential for ring 3!) */
     new_pdp[0] = (uint64_t)(uintptr_t)new_pd | 0x07;
 
-    /* Copy remaining old PDP entries (all zero, which is fine) */
-    for (int i = 1; i < 512; i++)
-        new_pdp[i] = old_pdp[i];
+    /* The interpreter at 0x60000000 uses PDP[1]. Never share its PD
+     * with the kernel or sibling processes: each child can remap it. */
+    for (int i = 1; i < 512; i++) {
+        uint64_t pdp_entry = old_pdp[i];
+        if (!(pdp_entry & 1)) continue;
+        if (pdp_entry & 0x80) return 0;
+
+        uint64_t *source_pd = (uint64_t *)(uintptr_t)(pdp_entry & ~0xFFFULL);
+        uint64_t *child_pd = page_frame_kernel();
+        if (!child_pd) return 0;
+        for (int j = 0; j < 512; j++) {
+            uint64_t pde = source_pd[j];
+            if ((pde & 1) && !(pde & 0x80)) {
+                uint64_t *source_pt = (uint64_t *)(uintptr_t)(pde & ~0xFFFULL);
+                uint64_t *child_pt = page_frame_kernel();
+                if (!child_pt) return 0;
+                for (int k = 0; k < 512; k++)
+                    child_pt[k] = source_pt[k] & ~0x04ULL;
+                child_pd[j] = (uint64_t)(uintptr_t)child_pt |
+                              ((pde & 0xFFFULL) | 0x07ULL);
+            } else {
+                child_pd[j] = pde & ~0x04ULL;
+            }
+        }
+        new_pdp[i] = (uint64_t)(uintptr_t)child_pd | 0x07;
+        /* ~~ watchpoint: o PD da região 3–4GB (APIC/fb) dos filhos do
+         * execve. Ele nasce zerado e depois vira lixo de usuário →
+         * rastrear alloc/free dele. ~~ */
+        if (i == 3) {
+            extern void watch_add(uint64_t pa);
+            watch_add((uint64_t)(uintptr_t)child_pd);
+            extern void serial_puts(const char *s);
+            extern void serial_puthex(uint32_t v);
+            serial_puts("[clone] pdpt3 child_pd=");
+            serial_puthex((uint32_t)(uint64_t)child_pd);
+            serial_puts(" pdp=");
+            serial_puthex((uint32_t)(uint64_t)new_pdp);
+            serial_puts("\r\n");
+        }
+    }
 
     /* Set up new PML4: entry 0 points to new PDP.
      * 0x07 = Present + R/W + User (U/S bit essential for ring 3!) */

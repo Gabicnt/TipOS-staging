@@ -60,6 +60,9 @@ const ET_DYN: u16 = 3;
 const DT_RELA: u64 = 7;
 const DT_RELASZ: u64 = 8;
 const DT_RELAENT: u64 = 9;
+const DT_RELRSZ: u64 = 0x23;
+const DT_RELR: u64 = 0x24;
+const DT_RELRENT: u64 = 0x25;
 const R_X86_64_RELATIVE: u32 = 8;
 
 // ~~ Elf64_Dyn ~~
@@ -95,9 +98,17 @@ export fn elf64_pie_base() u64 {
 // map_2mb_in_pml4: mapeia 2MB na tabela de páginas (huge pages FTW~)
 // serial_puts/puthex: debug pela serial (amo ver números~)
 extern fn mmap_user(addr: ?*anyopaque, length: usize, prot: i32, flags: i32) ?*anyopaque;
+extern fn page_frame_kernel() ?*anyopaque;
 extern fn map_2mb_in_pml4(pml4_pa: u64, virt: u64, phys: u64) i32;
 extern fn serial_puts(str: [*:0]const u8) void;
+extern fn serial_putc(c: u8) void;
 extern fn serial_puthex(val: u32) void;
+
+fn serial_putbytehex(value: u8) void {
+    const digits = "0123456789ABCDEF";
+    serial_putc(digits[value >> 4]);
+    serial_putc(digits[value & 0x0F]);
+}
 
 // ~~ map_2mb_ensure ~~
 // Mapeia 2MB, alocando as tabelas intermediárias (PD) se faltarem.
@@ -114,7 +125,7 @@ fn map_2mb_ensure(pml4_pa: u64, virt: u64, phys: u64) i32 {
 
     const pdpt = @as([*]u64, @ptrFromInt(@as(usize, @intCast(pml4[pml4_idx] & ~@as(u64, 0xFFF)))));
     if ((pdpt[pdpt_idx] & 1) == 0) {
-        const raw_pd = mmap_user(null, 4096, 3, 0) orelse return -1;
+        const raw_pd = page_frame_kernel() orelse return -1;
         const pd = @as([*]u64, @ptrCast(@alignCast(raw_pd)));
         var z: usize = 0;
         while (z < 512) : (z += 1) pd[z] = 0;
@@ -143,6 +154,210 @@ fn elf_hdr(data: [*]const u8) *const Elf64_Ehdr {
 // e_phoff dá onde começa a tabela, aí a gente itera com e_phentsize~ ☆
 fn elf_phdr(data: [*]const u8, offset: u64) *const Elf64_Phdr {
     return @ptrCast(@alignCast(data + offset));
+}
+
+fn relr_vaddr_in_load(ehdr: *const Elf64_Ehdr, data: [*]const u8, len: u32,
+                      address: u64, size: u64, file_backed: bool) bool {
+    if (address > ~@as(u64, 0) - size) return false;
+    var i: u16 = 0;
+    while (i < ehdr.e_phnum) : (i += 1) {
+        const phdr_off = ehdr.e_phoff + i * ehdr.e_phentsize;
+        if (phdr_off + @sizeOf(Elf64_Phdr) > len) return false;
+        const phdr = elf_phdr(data, phdr_off);
+        if (phdr.p_type != PT_LOAD) continue;
+        const segment_size = if (file_backed) phdr.p_filesz else phdr.p_memsz;
+        if (address >= phdr.p_vaddr and address - phdr.p_vaddr <= segment_size and
+            size <= segment_size - (address - phdr.p_vaddr)) return true;
+    }
+    return false;
+}
+
+fn relr_file_pointer(ehdr: *const Elf64_Ehdr, data: [*]const u8, len: u32,
+                     address: u64, size: u64) ?[*]const u8 {
+    if (address > ~@as(u64, 0) - size) return null;
+    var i: u16 = 0;
+    while (i < ehdr.e_phnum) : (i += 1) {
+        const phdr_off = ehdr.e_phoff + i * ehdr.e_phentsize;
+        if (phdr_off + @sizeOf(Elf64_Phdr) > len) return null;
+        const phdr = elf_phdr(data, phdr_off);
+        if (phdr.p_type != PT_LOAD or address < phdr.p_vaddr) continue;
+        const delta = address - phdr.p_vaddr;
+        if (delta > phdr.p_filesz or size > phdr.p_filesz - delta or
+            phdr.p_offset > len or delta > len - phdr.p_offset or
+            size > len - phdr.p_offset - delta) continue;
+        return data + phdr.p_offset + delta;
+    }
+    return null;
+}
+
+fn interp_frame_pointer(mapped: *const [32]u64, mapped_count: u32,
+                        base: u64, where: u64) ?*u64 {
+    if (base > ~@as(u64, 0) - where) return null;
+    const target_va = base + where;
+    const page_tag = (target_va & ~@as(u64, 0x1FFFFF)) >> 21;
+    var i: u32 = 0;
+    while (i < mapped_count) : (i += 1) {
+        if ((mapped[i] >> 32) != page_tag) continue;
+        const frame = mapped[i] & 0xFFFF_FFFF;
+        const offset = target_va & 0x1FFFFF;
+        return @ptrFromInt(@as(usize, @intCast(frame + offset)));
+    }
+    return null;
+}
+
+fn apply_relr_word(ehdr: *const Elf64_Ehdr, data: [*]const u8, len: u32,
+                   mapped: *const [32]u64, mapped_count: u32,
+                   base: u64, where: u64) bool {
+    if ((where & 7) != 0 or !relr_vaddr_in_load(ehdr, data, len, where, 8, false) or
+        base > ~@as(u64, 0) - where) return false;
+    const target_va = base + where;
+    const target = interp_frame_pointer(mapped, mapped_count, base, where) orelse
+        return false;
+    const before = target.*;
+    const after = before +% base;
+    target.* = after;
+    serial_puts("[RELR] target=");
+    serial_puthex(@as(u32, @truncate(target_va >> 32)));
+    serial_puthex(@as(u32, @truncate(target_va)));
+    serial_puts(" before=");
+    serial_puthex(@as(u32, @truncate(before >> 32)));
+    serial_puthex(@as(u32, @truncate(before)));
+    serial_puts(" after=");
+    serial_puthex(@as(u32, @truncate(after >> 32)));
+    serial_puthex(@as(u32, @truncate(after)));
+    serial_puts("\r\n");
+    return true;
+}
+
+fn apply_interp_relr(data: [*]const u8, len: u32, base: u64,
+                     mapped: *const [32]u64, mapped_count: u32,
+                     ehdr: *const Elf64_Ehdr) bool {
+    var relr_address: u64 = 0;
+    var relr_size: u64 = 0;
+    var relr_entry_size: u64 = 8;
+    var dynamic_vaddr: u64 = 0;
+    var rela_address: u64 = 0;
+    var has_relr = false;
+    var relr_address_slot: ?u64 = null;
+    var relr_size_slot: ?u64 = null;
+    var rela_address_slot: ?u64 = null;
+    var cleared_relr: u64 = ~@as(u64, 0);
+    var cleared_relrsz: u64 = ~@as(u64, 0);
+
+    var i: u16 = 0;
+    while (i < ehdr.e_phnum) : (i += 1) {
+        const phdr_off = ehdr.e_phoff + i * ehdr.e_phentsize;
+        if (phdr_off + @sizeOf(Elf64_Phdr) > len) return false;
+        const phdr = elf_phdr(data, phdr_off);
+        if (phdr.p_type != PT_DYNAMIC) continue;
+
+        dynamic_vaddr = phdr.p_vaddr;
+        if (phdr.p_offset > len or phdr.p_filesz > len - phdr.p_offset or
+            phdr.p_filesz % @sizeOf(Elf64_Dyn) != 0) return false;
+        const dynamic = @as([*]const Elf64_Dyn, @ptrCast(@alignCast(
+            data + phdr.p_offset)));
+        const dynamic_count = phdr.p_filesz / @sizeOf(Elf64_Dyn);
+        var dyn_index: u64 = 0;
+        while (dyn_index < dynamic_count) : (dyn_index += 1) {
+            const dyn = dynamic[@intCast(dyn_index)];
+            if (dyn.d_tag == 0) break;
+            switch (dyn.d_tag) {
+                DT_RELR => {
+                    relr_address = dyn.d_val;
+                    has_relr = true;
+                    relr_address_slot = phdr.p_vaddr +
+                        dyn_index * @sizeOf(Elf64_Dyn) + @offsetOf(Elf64_Dyn, "d_val");
+                },
+                DT_RELRSZ => {
+                    relr_size = dyn.d_val;
+                    relr_size_slot = phdr.p_vaddr +
+                        dyn_index * @sizeOf(Elf64_Dyn) + @offsetOf(Elf64_Dyn, "d_val");
+                },
+                DT_RELA => {
+                    rela_address = dyn.d_val;
+                    rela_address_slot = phdr.p_vaddr +
+                        dyn_index * @sizeOf(Elf64_Dyn) + @offsetOf(Elf64_Dyn, "d_val");
+                },
+                DT_RELRENT => relr_entry_size = dyn.d_val,
+                else => {},
+            }
+        }
+        break;
+    }
+
+    serial_puts("[RELR] base=");
+    serial_puthex(@as(u32, @truncate(base >> 32)));
+    serial_puthex(@as(u32, @truncate(base)));
+    serial_puts(" dynamic=");
+    serial_puthex(@as(u32, @truncate(dynamic_vaddr >> 32)));
+    serial_puthex(@as(u32, @truncate(dynamic_vaddr)));
+    serial_puts(" rela=");
+    serial_puthex(@as(u32, @truncate(rela_address >> 32)));
+    serial_puthex(@as(u32, @truncate(rela_address)));
+    serial_puts(" relr=");
+    serial_puthex(@as(u32, @truncate(relr_address)));
+    serial_puts(" size=");
+    serial_puthex(@as(u32, @truncate(relr_size)));
+    serial_puts(" ent=");
+    serial_puthex(@as(u32, @truncate(relr_entry_size)));
+    serial_puts("\r\n");
+    if (!has_relr or relr_size == 0) return true;
+    if (relr_entry_size != 8 or relr_size % relr_entry_size != 0 or
+        !relr_vaddr_in_load(ehdr, data, len, relr_address, relr_size, true) or
+        base > ~@as(u64, 0) - relr_address)
+        return false;
+
+    const relr_bytes = relr_file_pointer(ehdr, data, len, relr_address, relr_size) orelse
+        return false;
+    const relr = @as([*]const u64, @ptrCast(@alignCast(relr_bytes)));
+    const relr_count = relr_size / relr_entry_size;
+    var where: u64 = 0;
+    var relr_index: u64 = 0;
+    while (relr_index < relr_count) : (relr_index += 1) {
+        const entry = relr[@intCast(relr_index)];
+        if ((entry & 1) == 0) {
+            where = entry;
+            if (!apply_relr_word(ehdr, data, len, mapped, mapped_count, base, where) or
+                where > ~@as(u64, 0) - 8) return false;
+            where += 8;
+        } else {
+            var bitmap = entry >> 1;
+            var bit: u32 = 0;
+            while (bit < 63) : (bit += 1) {
+                if ((bitmap & 1) != 0 and
+                    !apply_relr_word(ehdr, data, len, mapped, mapped_count, base, where))
+                    return false;
+                bitmap >>= 1;
+                if (where > ~@as(u64, 0) - 8) return false;
+                where += 8;
+            }
+        }
+    }
+    if (relr_address_slot) |slot| {
+        const relr_tag = interp_frame_pointer(mapped, mapped_count, base, slot) orelse
+            return false;
+        relr_tag.* = 0;
+        cleared_relr = relr_tag.*;
+    }
+    if (relr_size_slot) |slot| {
+        const relrsz_tag = interp_frame_pointer(mapped, mapped_count, base, slot) orelse
+            return false;
+        relrsz_tag.* = 0;
+        cleared_relrsz = relrsz_tag.*;
+    }
+    if (rela_address_slot) |slot| {
+        const rela_tag = interp_frame_pointer(mapped, mapped_count, base, slot) orelse
+            return false;
+        serial_puts("[RELR] DT_RELA frame=");
+        serial_puthex(@as(u32, @truncate(rela_tag.* >> 32)));
+        serial_puthex(@as(u32, @truncate(rela_tag.*)));
+        serial_puts("\r\n");
+    }
+    serial_puts("[RELR] applied tags=");
+    serial_puthex(@as(u32, @truncate(cleared_relr)));
+    serial_puthex(@as(u32, @truncate(cleared_relrsz)));
+    serial_puts("\r\n");
+    return true;
 }
 
 // ~~ elf64_load ~~
@@ -291,6 +506,8 @@ export fn elf64_load_at(data: [*]const u8, len: u32, pml4: u64, force_base: u64)
         }
     }
 
+    if (!apply_interp_relr(data, len, base, &mapped, mapped_count, ehdr)) return null;
+
     const entry = base + ehdr.e_entry;
     serial_puts("elf64at: entry=");
     serial_puthex(@as(u32, @truncate(entry)));
@@ -343,6 +560,12 @@ export fn elf64_load_into_pml4(data: [*]const u8, len: u32, pml4: u64) ?*anyopaq
         serial_puthex(@as(u32, @truncate(dst_va)));
         serial_puts("..");
         serial_puthex(@as(u32, @truncate(seg_end)));
+        serial_puts(" off=");
+        serial_puthex(@as(u32, @truncate(phdr.p_offset)));
+        serial_puts(" filesz=");
+        serial_puthex(@as(u32, @truncate(phdr.p_filesz)));
+        serial_puts(" memsz=");
+        serial_puthex(@as(u32, @truncate(phdr.p_memsz)));
         serial_puts("\n");
 
         var va: u64 = aligned_start;
@@ -402,6 +625,32 @@ export fn elf64_load_into_pml4(data: [*]const u8, len: u32, pml4: u64) ?*anyopaq
                 const src = data + phdr.p_offset + chunk_off;
                 var j: u64 = 0;
                 while (j < n) : (j += 1) p[dst_off + j] = src[j];
+                const check_va: u64 = 0x10002C20;
+                const chunk_va = va + dst_off;
+                if (check_va >= chunk_va and check_va + 16 <= chunk_va + n) {
+                    const check_src = data + phdr.p_offset + (check_va - dst_va);
+                    const check_dst_off = check_va - va;
+                    var matches = true;
+                    serial_puts("[ELF-CHK] chunk=0x");
+                    serial_puthex(@as(u32, @truncate(va)));
+                    serial_puts(" phys=0x");
+                    serial_puthex(@as(u32, @truncate(@intFromPtr(p))));
+                    serial_puts(" buf=");
+                    var byte_index: u64 = 0;
+                    while (byte_index < 16) : (byte_index += 1) {
+                        serial_putbytehex(check_src[byte_index]);
+                        if (byte_index < 15) serial_putc(' ');
+                    }
+                    serial_puts(" phys=");
+                    byte_index = 0;
+                    while (byte_index < 16) : (byte_index += 1) {
+                        const copied = p[check_dst_off + byte_index];
+                        serial_putbytehex(copied);
+                        if (copied != check_src[byte_index]) matches = false;
+                        if (byte_index < 15) serial_putc(' ');
+                    }
+                    serial_puts(if (matches) " MATCH\r\n" else " MISMATCH\r\n");
+                }
             }
         }
     }

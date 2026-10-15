@@ -117,6 +117,8 @@ _start:
 
 bits 64
 extern syscall_entry
+extern __bss_start
+extern __bss_end
 start64:
     mov ax, 0x10
     mov ds, ax
@@ -126,6 +128,13 @@ start64:
     mov ss, ax
     mov rsp, stack_top
 
+    lea rdi, [rel __bss_start]
+    lea rcx, [rel __bss_end]
+    sub rcx, rdi
+    xor eax, eax
+    cld
+    rep stosb
+
     ; ~~ MSR setup for 'syscall' instruction (Linux x86_64 ABI) ~~
     ; Habilita IA32_EFER.SCE (Syscall Enable, bit 0)~
     ; Se não ligar isso, 'syscall' dá #UD (undefined instruction)~
@@ -133,6 +142,9 @@ start64:
     mov ecx, 0xC0000080      ; IA32_EFER
     rdmsr
     or eax, 1                ; bit 0 = SCE (Syscall Enable)
+    or eax, 1 << 11          ; bit 11 = NXE (No-Execute enable) ~
+    ;  Sem NXE, o bit NX (63) numa PTE é RESERVADO e o mprotect(RELRO)
+    ;  do glibc quebrava toda PTE com #PF RSVD (err=0x0D/0x09)~
     wrmsr
 
     ; IA32_STAR (0xC0000081):
@@ -206,13 +218,18 @@ gdt64_ptr:
 ; PML4: 512 entradas × 8 bytes = 4KB ~ entrada 0 → PDP, resto = 0 (not present)
 ; PDP:  512 entradas × 8 bytes = 4KB ~ entrada 0 → PD, resto = 0
 ; PD:   512 entradas × 8 bytes = 4KB ~ cada entrada = 2MB huge page (PS=1)
-; Flags nas entradas: 0x07 = Present (P=bit0) | R/W (bit1) | User (bit2)
-;   0x80 = PS (bit7, Page Size) = 1 → 2MB page (não precisa de PT)
-;   Total: 0x87 = P|R/W|U|PS
-; Mapeamento: PD[i] → endereço (i * 0x200000) + 0x87~
-;   PD[0] → 0x00000000 + 0x87 (primeiro 2MB: 0x000000-0x1FFFFF)~
-;   PD[1] → 0x00200000 + 0x87 (2MB: 0x200000-0x3FFFFF)~
-;   ... até PD[511] → 0xFFE00000 + 0x87 (último 2MB do 1GB)~
+; Flags nas entradas: 0x03 = Present (P=bit0) | R/W (bit1) | PS (bit7)
+;   SEM bit User (bit2): identidade low é SUPERVISOR de nascença (FASE5).
+;   Antes era 0x87 (com U): TODO o RAM baixo (inclusive frames livres
+;   do buddy!) ficava user-acessível no mapa base — escrita user por
+;   alias envenenava a freelist (EXC#0x0D no mmap do foot). Userland
+;   recebe U/S explícito onde tem dono (loader 0x87, map_user_4kb,
+;   wire, demand, add_user_range, map_phys); ring 0 ignora U/S.
+;   Total: 0x83 = P|R/W|PS
+; Mapeamento: PD[i] → endereço (i * 0x200000) + 0x83~
+;   PD[0] → 0x00000000 + 0x83 (primeiro 2MB: 0x000000-0x1FFFFF)~
+;   PD[1] → 0x00200000 + 0x83 (2MB: 0x200000-0x3FFFFF)~
+;   ... até PD[511] → 0xFFE00000 + 0x83 (último 2MB do 1GB)~
 ; 512 × 2MB = 1GB identity mapped ~ suficiente pro kernel, framebuffer, etc~
 section .paging
 align 4096
@@ -225,7 +242,7 @@ pdp_table:
 pd_table:
     %assign i 0
     %rep 512
-        dq (i * 0x200000) + 0x87    ; 0x87 = Present | R/W | User | PS (2MB page)
+        dq (i * 0x200000) + 0x83    ; 0x83 = Present | R/W | PS (2MB, supervisor — FASE5)
         %assign i i+1
     %endrep
 

@@ -21,6 +21,15 @@ var raw_buf: [RAW_BUF_SIZE]u8 = undefined;
 var raw_head: usize = 0;
 var raw_tail: usize = 0;
 
+const EVENT_BUF_SIZE = 256;
+var event_buf: [EVENT_BUF_SIZE]u8 = undefined;
+var event_head: usize = 0;
+var event_tail: usize = 0;
+var keyboard_trace_count: u32 = 0;
+
+extern fn serial_puts(s: [*:0]const u8) void;
+extern fn serial_puthex(value: u32) void;
+
 // ~~ norm / shf ~~
 // Tabelas de tradução scan code → caractere ASCII.
 // `norm`: teclas normais (shift desligado)
@@ -94,6 +103,15 @@ fn raw_push(b: u8) void {
     }
 }
 
+fn event_push(b: u8) void {
+    const next = (event_head + 1) % EVENT_BUF_SIZE;
+    if (next == event_tail) {
+        event_tail = (event_tail + 1) % EVENT_BUF_SIZE;
+    }
+    event_buf[event_head] = b;
+    event_head = next;
+}
+
 // ~~ keyboard_init ~~
 // Inicializa o estado do teclado: zera o buffer, reseta shift/ctrl.
 // Chama uma vez no boot e esquece~ (ou chama de novo se quiser resetar)
@@ -102,6 +120,8 @@ export fn keyboard_init() void {
     buf_tail = 0;
     raw_head = 0;
     raw_tail = 0;
+    event_head = 0;
+    event_tail = 0;
     shift_pressed = 0;
     ctrl_pressed = 0;
 }
@@ -116,6 +136,17 @@ export fn keyboard_init() void {
 export fn keyboard_handler() void {
     const scancode = inb(0x60);
     raw_push(scancode);
+    event_push(scancode);
+    if (keyboard_trace_count < 32 and
+        (scancode == 0x1F or scancode == 0x9F or scancode == 0xE0 or
+         scancode == 0x11 or scancode == 0x91 or scancode == 0x48 or
+         scancode == 0xC8 or scancode == 0x50 or scancode == 0xD0))
+    {
+        keyboard_trace_count += 1;
+        serial_puts("[KIRQ] ");
+        serial_puthex(scancode);
+        serial_puts("\r\n");
+    }
     if ((scancode & 0x80) != 0) {
         const released = scancode & 0x7F;
         switch (released) {
@@ -124,7 +155,20 @@ export fn keyboard_handler() void {
             else => {},
         }
     } else {
-        if (scancode == 0xE0) return;
+        // 0xE0 e prefixo extended (setas: E0 48/C8, E0 50/D0, E0 4B/CB, E0 4D/CD;
+        // R-ctrl/alt: E0 1D/9D, E0 38/B8). O byte E0 ja foi pushado em raw/event
+        // acima; o byte seguinte sera processado na proxima IRQ. Nao pode
+        // dar EOI+return sem esperar o segundo byte — o fix antigo descartava
+        // o scancode real e o libinput nunca via as setas. Agora apenas
+        // ignora a conversao ASCII para E0 e deixa cair no EOI final.
+        if (scancode == 0xE0) {
+            outb(0x20, 0x20);
+            return;
+        }
+        // Se o byte anterior foi 0xE0, este e o scan extended real.
+        // raw/event ja contem [E0, sc2]; para kbd_push/ctrl/shift precisamos
+        // tratar sc2 sem conflitar com a tabela norm (0..0x7F).
+        // Mantemos shift/ctrl apenas para scancodes nao-extended aqui.
         if (scancode < norm.len) {
             const table = if (shift_pressed != 0) &shf else &norm;
             const ch = table[scancode];
@@ -178,6 +222,22 @@ export fn kbd_raw_read() u8 {
     if (raw_head == raw_tail) return 0;
     const b = raw_buf[raw_tail];
     raw_tail = (raw_tail + 1) % RAW_BUF_SIZE;
+    return b;
+}
+
+export fn keyboard_event_avail() i32 {
+    if (event_head != event_tail) return 1;
+    return 0;
+}
+
+export fn keyboard_event_clear() void {
+    event_tail = event_head;
+}
+
+export fn keyboard_event_read() u8 {
+    if (event_head == event_tail) return 0;
+    const b = event_buf[event_tail];
+    event_tail = (event_tail + 1) % EVENT_BUF_SIZE;
     return b;
 }
 

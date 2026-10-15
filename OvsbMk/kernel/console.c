@@ -23,6 +23,12 @@ static uint32_t fg_color = 0xFFC0C0C0;
 static uint32_t bg_color = 0xFF0A0A1A;
 static int cursor_visible = 1;
 
+/* ~~ console no framebuffer liga/desliga ~~
+ * O Xorg assume o fbdev no boot: se o console do kernel continuar
+ * desenhando por cima, o log suja a tela do Xterm. Desliga em
+ * shell.c (AUTOEXEC) antes de lançar /BIN/XORG; o serial continua. */
+int g_console_fbdev_enabled = 1;
+
 /* Output redirection for terminal */
 static char *term_out_buf = NULL;
 static int  *term_out_len = NULL;
@@ -71,6 +77,7 @@ static int abs_row(int r) {
 
 /* ~ kyun~ mais uma funcao pra fazer o kernel n morrer */
 static void render_row(int r) {
+    if (!g_console_fbdev_enabled) return;   /* ~~ Xorg manda no fb ~~ */
     int ar = abs_row(r);
     if (ar < 0 || ar >= SCROLLBACK) return;
     int y = r * row_h;
@@ -91,7 +98,7 @@ void console_clear(void) {
         for (int j = 0; j < CONSOLE_COLS; j++)
             scrollback[i][j] = ' ';
     cursor_row = 0; cursor_col = 0; scroll_start = 0;
-    vesa_fill_screen(bg_color);
+    if (g_console_fbdev_enabled) vesa_fill_screen(bg_color);
 }
 
 /* ~~ console_putchar ~~ */

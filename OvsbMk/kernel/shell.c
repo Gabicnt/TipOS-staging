@@ -22,6 +22,8 @@
 #include "memory.h"
 #include "mach_o.h"
 #include "process.h"
+#include "pit.h"
+extern volatile int g_xorg_fb_mapped;
 extern int g_use_ext2;
 extern int vfs_stat_size(const char *name, uint32_t *size, uint8_t *attr);
 extern int fs_read_file(const char *name, unsigned char *buf, unsigned int count);
@@ -29,6 +31,7 @@ extern int elf64_find_interp(unsigned char *data, unsigned int len, char *out, u
 extern void *elf64_load_at(unsigned char *data, unsigned int len, uint64_t pml4, uint64_t force_base);
 #include "../fs/vfs.h"
 static uint64_t dyn_interp_entry = 0;
+static uint64_t dyn_interp_base = 0;
 static int dyn_is_dynamic = 0;
 #include "serial.h"
 #include "../lib/gui/vesa.h"
@@ -143,7 +146,7 @@ static void cmd_hexdump(const char *args) {
 }
 
 /* ~ kyun~ mais uma funcao pra fazer o kernel n morrer */
-#define EXEC_USER_STACK_SIZE 65536
+#define EXEC_USER_STACK_SIZE 1048576
 
 /* ~ simples mas essencial, n mexe sem saber oq ta fazendo */
 static void cmd_exec(const char *args) {
@@ -153,11 +156,11 @@ static void cmd_exec(const char *args) {
     }
     /* ~~ Separa o nome do arquivo dos argumentos ~~
      * argv[0] = binario, argv[1..] = args pro ELF (ex: exec XORG XORG.CONF)~ */
-    char argv_bufs[8][64];
-    char *argv[9];
+    char argv_bufs[18][64];
+    char *argv[19];
     int argc = 0;
     const char *p = args;
-    while (*p && argc < 8) {
+    while (*p && argc < 18) {
         while (*p == ' ') p++;
         if (!*p) break;
         int len = 0;
@@ -264,6 +267,10 @@ static void cmd_exec(const char *args) {
         void *entry = elf64_load_into_pml4(buf, fsize, child_pml4);
         uint64_t main_binary_entry = (uint64_t)entry; /* entry ORIGINAL do binário */
         uint64_t main_phdr_addr = elf_phdr;           /* phdrs já mapeados na memória */
+        unsigned char *saved_buf = buf;               /* dynlink precisa do arquivo */
+        uint32_t saved_fsize = fsize;
+        // Wayland lab fix: reset DYN globals por exec — senão EXEC estático herda ld.so anterior (FB bug)
+        dyn_interp_entry = 0; dyn_interp_base = 0; dyn_is_dynamic = 0;
 
         /* ~~ ELF DINÂMICO (#71): carrega ld-musl se tiver PT_INTERP~~ */
         char interp_path[256];
@@ -283,7 +290,8 @@ static void cmd_exec(const char *args) {
                     const uint64_t INTERP_BASE = 0x60000000ULL;
                     ientry = elf64_load_at(idata, sizeof(idata), child_pml4, INTERP_BASE);
                     if (ientry) {
-                        dyn_interp_entry = 0x60000000ULL; /* BASE de carga (não o entry!)*/
+                        dyn_interp_entry = (uint64_t)ientry; /* entry REAL do ld.so */
+                        dyn_interp_base = INTERP_BASE;       /* AT_BASE = base do ld.so */
                         dyn_is_dynamic = 1;
                         serial_puts("[dyn] ld.so mapeado\r\n");
                     } else {
@@ -292,6 +300,21 @@ static void cmd_exec(const char *args) {
                 } else {
                     console_write("exec: interpretador não lido\n");
                 }
+            }
+        }
+        /* ~~ FASE 4: linker dinâmico no kernel (dynlink.c) ~~
+         * Se não achou ld.so no FS (interp ausente/falhou), aplica
+         * DT_NEEDED + RELA aqui mesmo e o binário roda direto no entry~ */
+        if (!dyn_is_dynamic && is_elf && entry) {
+            extern int dynlink_process(uint64_t pml4, unsigned char *data,
+                                       unsigned int len, uint64_t base);
+            int dl = dynlink_process(child_pml4, saved_buf, saved_fsize, elf_base);
+            if (dl == 0) {
+                console_write("exec: dynlink kernel OK\n");
+            } else if (dl > 0) {
+                serial_puts("[dyn] estatico, sem link\r\n");
+            } else {
+                console_write("exec: dynlink falhou\n");
             }
         }
         if (buf) { kfree(buf); }
@@ -307,15 +330,19 @@ static void cmd_exec(const char *args) {
         /* ~~ Aloca pilha do usuario ~~
          * O kmalloc pega do heap (0xA00000+)~
          * Depois a gente libera o U/S pro processo acessar~ */
-        void *ustack = kmalloc(EXEC_USER_STACK_SIZE);
+        void *ustack = mmap_user(0, EXEC_USER_STACK_SIZE, 3, 0);
         if (!ustack) { console_write("exec: sem stack\n"); return; }
         uint64_t stack_addr = (uint64_t)ustack;
-        for (uint64_t va = stack_addr & ~0x1FFFFFULL;
-             va < stack_addr + EXEC_USER_STACK_SIZE; va += 0x200000)
-            pml4_add_user(child_pml4, va);
+        /* ~~ U/S só nas páginas DO STACK (1MB): a janela de 2MB do
+         * identity também contém tabelas/frames do kernel — marcar a
+         * janela inteira deixava o user escrever nelas. E mmap_user
+         * (não kmalloc) = FRAME_USER → o fork COPIA o stack em vez de
+         * compartilhar (canário do filho não murcha mais). ~~ */
+        pml4_add_user_range(child_pml4, stack_addr,
+                            stack_addr + EXEC_USER_STACK_SIZE);
 
         int pid = proc_spawn(fname, entry, (uint8_t *)ustack + EXEC_USER_STACK_SIZE);
-        if (pid < 0) { console_write("exec: spawn falhou\n"); kfree(ustack); return; }
+        if (pid < 0) { console_write("exec: spawn falhou\n"); munmap_user(ustack, EXEC_USER_STACK_SIZE); return; }
 
         /* ~~ Troca a PML4 e monta o vetor auxiliar ~~
          * A PML4 vazia do proc_spawn é substituida pela
@@ -327,16 +354,43 @@ static void cmd_exec(const char *args) {
                 pml4_destroy(pcb_table[i].pml4);
                 pcb_table[i].pml4 = child_pml4;
                 /* ~~ Program break começa no fim do BSS do ELF ~~ */
-                if (elf_bss_end) pcb_table[i].program_break = elf_bss_end;
+                if (elf_bss_end) {
+                    pcb_table[i].program_break = elf_bss_end;
+                    pcb_table[i].heap_start = elf_bss_end;
+                    serial_puts("[ELF-BRK] pid=");
+                    serial_puthex((uint32_t)pcb_table[i].pid);
+                    serial_puts(" end=");
+                    serial_puthex((uint32_t)elf_bss_end);
+                    serial_puts(" floor=");
+                    serial_puthex((uint32_t)pcb_table[i].heap_start);
+                    serial_puts("\r\n");
+                }
+                pcb_table[i].fs_base = 0x50000000ULL + ((uint64_t)pcb_table[i].pid * 0x1000ULL);
+                if (map_user_4kb(pcb_table[i].pml4, pcb_table[i].fs_base) < 0)
+                    pcb_table[i].fs_base = 0x1000ULL;
+                volatile uint64_t *tls_page = (volatile uint64_t *)(uintptr_t)pcb_table[i].fs_base;
+                tls_page[0] = 0; tls_page[1] = 0; tls_page[2] = 0; tls_page[3] = 0;
                 uint64_t *kframe = (uint64_t *)pcb_table[i].kernel_rsp;
-                /* ~~ Ambiente minimo: DISPLAY=:0 pro FVWM achar o
-                 * servidor X~ (o musl le da area envp da pilha)~~ */
-                static char *exec_env[] = { "DISPLAY=:0", "PATH=/bin", "LD_LIBRARY_PATH=/lib" };
-                uint64_t atbase = dyn_is_dynamic ? dyn_interp_entry : elf_base;
+                /* WAYLAND LAB: env X11 comentado reversivelmente
+                 * DISPLAY=:0/HOME=/ETC/X11 eram para FVWM/Xorg.
+                 * LD_BIND_NOW permanece util para dynlink generico. */
+                // legado X11: DISPLAY=:0, HOME=/ETC/X11 -> comentado
+                // FASE1 Caminho B: cache sem dot para contornar FAT dot-dir bug
+                static char *exec_env[] = { "PATH=/bin", "SHELL=/BIN/SH",
+                                            "LD_LIBRARY_PATH=/lib:/usr/lib", "LD_BIND_NOW=1",
+                                            "HOME=/root",
+                                            "XDG_CACHE_HOME=/cache",
+                                            "FONTCONFIG_FILE=/etc/fonts/fonts.conf",
+                                            "XDG_RUNTIME_DIR=/tmp",
+                                            "LANG=C.UTF-8",
+                                            "LC_ALL=C.UTF-8",
+                                            "TERM=xterm-256color" };
+                uint64_t atbase = dyn_is_dynamic ? dyn_interp_base : elf_base;
                 kframe[18] = setup_linux_user_stack(&pcb_table[i], kframe[18],
                                                      main_phdr_addr, elf_phent, elf_phnum,
                                                      atbase, argv, argc,
-                                                     exec_env, 0); /* TESTE A/B: sem envp */
+                                                     exec_env, 11,
+                                                     main_binary_entry);
                 /* ~~ debug: dump dos primeiros qwords da user stack ~~ */
                 if (dyn_is_dynamic) {
                     uint64_t *usp = (uint64_t *)kframe[18];
@@ -365,6 +419,26 @@ static void cmd_exec(const char *args) {
         }
 
         console_printf("exec: PID %d rodando\n", pid);
+        /* ~~ debug: trace de syscall do fvwm/xterm (onde trava no X) ~~ */
+        {
+            extern int g_tipos_trace_pid;
+            int hit = 0;
+            for (const char *q = fname; *q; q++) {
+                if (!q[0] || !q[1] || !q[2] || !q[3]) break;
+                if ((q[0]=='F'||q[0]=='f') && (q[1]=='V'||q[1]=='v') &&
+                    (q[2]=='W'||q[2]=='w') && (q[3]=='M'||q[3]=='m')) hit = 1;
+                if ((q[0]=='X'||q[0]=='x') && (q[1]=='T'||q[1]=='t') &&
+                    (q[2]=='E'||q[2]=='e') && (q[3]=='R'||q[3]=='r')) hit = 1;
+                /* FASE5-DBG temporário: trace do foot (roundtrip EINVAL) */
+                if ((q[0]=='F'||q[0]=='f') && (q[1]=='O'||q[1]=='o') &&
+                    (q[2]=='O'||q[2]=='o') && (q[3]=='T'||q[3]=='t')) hit = 1;
+            }
+            if (hit) {
+                g_tipos_trace_pid = pid;
+                serial_puts("[trace] pid="); serial_puthex((uint32_t)pid);
+                serial_puts("\r\n");
+            }
+        }
         if (bg) {
             /* ~~ Background: o shell volta pro prompt NA HORA!~~
              * NAO da kfree(ustack) — o processo ta usando ela~
@@ -387,7 +461,6 @@ static void cmd_exec(const char *args) {
                         break;
                     }
             }
-            proc_yield();
             return;
         }
         process_switch_to(pid);
@@ -559,6 +632,41 @@ void shell_init(void) {
     cmd_exec("/bin/HELLO");
     /* Then try the terminal test (threads/sinais) */
     cmd_exec("/bin/TTEST");
+    cmd_exec("/BIN/PTY_TEST");
+    cmd_exec("/BIN/SIGNAL_TEST");
+    cmd_exec("/BIN/SIGCHLD_TEST");
+    cmd_exec("/BIN/SIGWINCH_TEST");
+    cmd_exec("/BIN/DYN_TEST");
+    cmd_exec("/BIN/HELLO_DYN");
+    /* AUTO-BOOT TipOS (Wayland base): só compositor.
+     * ovsb-desktop vive no repo OvsbOS (não faz parte da base). */
+    cmd_exec("/BIN/WAYLAND_COMPOSITOR_LIB &");
+    sleep_ms(2000);
+    // cmd_exec("/BIN/OVSB-DESKTOP &");   // OvsbOS (outro repo)
+    // cmd_exec("/BIN/FOOT");             // manual (via menu, OvsbOS)
+    // Wayland lab: fb/evdev tested (FB_EVDEV_TEST on demand)
+    // cmd_exec("/BIN/FB_EVDEV_TEST");
+    // MEMFD test sem auto-run (manual: exec /BIN/MEMFD_RAW_SCM)
+    // MEMFD dedicated test removido — compositor retangulo agora
+    // Wayland compositor retangulo (Parte 4 Commit 3) — so compositor em background
+    // Cliente de teste manual: exec /BIN/WAYLAND_SHM_CLIENT  (nao auto-run)
+//     cmd_exec("/BIN/WAYLAND_COMPOSITOR_SHM &");
+    // FASE1: auto-run removido (shell limpa)
+    /* WAYLAND LAB: X11 autoexec desabilitado (XORG/FVWM2/XTERM) — ver Parte 0
+     * Reversivel: descomentar para restaurar abordagem X11.
+     * Framebuffer permanece com console ativo para fase Wayland.
+     */
+    // /* ~~ AUTOEXEC FASE 5: Xorg sobe no boot ~~
+    //  * rootfs X11: /BIN/XORG + libs em /LIB, /LIB64, xorg.conf em
+    //  * /ETC/X11/XORG.CONF. Log detalhado em /dev/stderr~ */
+    // /* ~~ console do kernel sai do fbdev: o Xorg vira o dono do
+    //  * framebuffer (senao o log do kernel pinta por cima do Xterm)~~ */
+    // extern void vesa_fill_screen(unsigned int color);
+    // vesa_fill_screen(0x000000);   /* limpa o frame congelado do console */
+    // g_console_fbdev_enabled = 0;
+    // cmd_exec("/BIN/XORG -config /ETC/X11/XORG.CONF -ac -nolisten local -logfile /dev/stderr -verbose 7 -logverbose 7 &");
+    // cmd_exec("/BIN/FVWM2 -f /ETC/X11/.fvwm2rc &");  /* fvwm2: StartFunction lanca XTERM -e /BIN/SH */
+    // cmd_exec("/BIN/XTERM -e /BIN/SH &");  /* garantia extra: xterm puro com shell */
     /* ~~ cwd fake sob ext2 — os paths de exec são absolutos~~ */
     /* TIPOS-TEST: DISP desligado pra liberar o framebuffer pro Xorg.
      * Reverter antes de mergear: cmd_exec("DISP"); */

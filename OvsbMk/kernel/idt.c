@@ -16,6 +16,7 @@
 #include "serial.h"
 #include "memory.h"
 #include "process.h"
+#include "../lib/gui/vesa.h"
 
 #define IDT_ENTRIES 256
 
@@ -88,6 +89,25 @@ void idt_set_irq12(void) {
                   IDT_PRESENT | IDT_INT_GATE);
 }
 
+/* ~~ kill_user_exc ~ exceção de ring 3 não-recuperável: mata o processo
+ * (igual SYS_exit) em vez de cli;hlt que congela a QEMU inteira e
+ * mascara os erros seguintes (fase 5) ~~ */
+static void kill_user_exc(uint64_t *regs, uint64_t exc, const char *why) {
+    serial_puts(why);
+    serial_puts(" exc="); serial_puthex((uint32_t)exc);
+    serial_puts(" pid="); serial_puthex((uint32_t)process_current_pid());
+    serial_puts(" rip="); serial_puthex((uint32_t)regs[17]);
+    serial_puts(" err="); serial_puthex((uint32_t)regs[16]);
+    serial_puts("\r\n");
+    pcb_t *me = process_current();
+    int code = -128 - (int)exc;
+    if (me && me->th_parent_pid >= 0)
+        proc_thread_exit(code);       /* só a thread morre~ */
+    else
+        process_exit_current(code);   /* processo de verdade (não retorna) */
+    for (;;) __asm__ volatile("cli; hlt");
+}
+
 /* ~~ idt_handler ~ "Morreu? Vou te mostrar ONDE!" ~~
  * Quando uma excecao acontece (tipo divisao por zero, page fault, etc),
  * a CPU empilha SS, RSP, RFLAGS, CS, RIP (se veio do ring 3) e o isr_common
@@ -113,7 +133,36 @@ void idt_handler(uint64_t *regs) {
     if (exc_num == 14) {
         uint64_t cr2;
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
+        if ((regs[18] & 3) == 0) {
+            extern framebuffer_t g_fb;
+            extern int g_fb_active;
+            if (g_fb_active && g_fb.addr && cr2 >= g_fb.addr &&
+                cr2 - g_fb.addr < (uint64_t)g_fb.pitch * g_fb.height) {
+                uint64_t cr3;
+                asm volatile("mov %%cr3, %0" : "=r"(cr3));
+                uint64_t page_base = cr2 & ~0x1FFFFFULL;
+                if (pml4_map_phys(cr3, page_base, page_base, 0x200000, 1) == 0) {
+                    asm volatile("invlpg (%0)" : : "r"(cr2) : "memory");
+                    serial_puts("[FB-PF-REMAP] va=");
+                    serial_puthex((uint32_t)page_base);
+                    serial_puts("\r\n");
+                    return;
+                }
+            }
+        }
         if (cr2 != 0xDEADBEEF) {
+            static int doom_pf_probe_count = 0;
+            if (doom_pf_probe_count < 3 && regs[17] == 0x10002C23) {
+                doom_pf_probe_count++;
+                const volatile uint8_t *code = (const volatile uint8_t *)0x10002C20;
+                serial_puts("[PF-CODE] cr2="); serial_puthex((uint32_t)cr2);
+                serial_puts(" bytes=");
+                for (int i = 0; i < 16; i++) {
+                    serial_puthex(code[i]);
+                    if (i != 15) serial_putc(' ');
+                }
+                serial_puts("\r\n");
+            }
             uint32_t fslo, fshi;
             __asm__ volatile("rdmsr" : "=a"(fslo), "=d"(fshi) : "c"(0xC0000100));
             serial_puts("\r\nPF@");
@@ -127,6 +176,10 @@ void idt_handler(uint64_t *regs) {
             serial_puthex((uint32_t)err_code);
             serial_puts(" RIP=");
             serial_puthex((uint32_t)regs[17]);
+            serial_puts(" U_RSP=");
+            serial_puthex((uint32_t)regs[20]);
+            serial_puts(" RBP=");
+            serial_puthex((uint32_t)regs[8]);
             serial_puts(" RDI=");
             serial_puthex((uint32_t)regs[9]);
             serial_puts(" RSI=");
@@ -176,17 +229,29 @@ void idt_handler(uint64_t *regs) {
                     uint64_t *pdv = (uint64_t *)(uintptr_t)pd_pa;
                     serial_puts(" PDpa="); serial_puthex((uint32_t)pd_pa);
                     serial_puts(" PD["); serial_puthex((uint32_t)pd_idx); serial_puts("]="); serial_puthex((uint32_t)pdv[pd_idx]);
-                    if ((pdv[pd_idx] & 1) && !(pdv[pd_idx] & 0x80)) {
-                        int pt_idx = (cr2 >> 12) & 0x1FF;
-                        uint64_t pt_pa = pdv[pd_idx] & ~0xFFFULL;
-                        uint64_t *ptv = (uint64_t *)(uintptr_t)pt_pa;
-                        serial_puts(" PTpa="); serial_puthex((uint32_t)pt_pa);
-                        serial_puts(" PT["); serial_puthex((uint32_t)pt_idx); serial_puts("]="); serial_puthex((uint32_t)ptv[pt_idx]);
-                    }
+                serial_puts(" PDhi="); serial_puthex((uint32_t)(pdv[pd_idx] >> 32));
+            if ((pdv[pd_idx] & 1) && !(pdv[pd_idx] & 0x80)) {
+                int pt_idx = (cr2 >> 12) & 0x1FF;
+                uint64_t pt_pa = pdv[pd_idx] & ~0xFFFULL;
+                uint64_t *ptv = (uint64_t *)(uintptr_t)pt_pa;
+                serial_puts(" PTpa="); serial_puthex((uint32_t)pt_pa);
+                serial_puts(" PT["); serial_puthex((uint32_t)pt_idx); serial_puts("]="); serial_puthex((uint32_t)ptv[pt_idx]);
+                serial_puts(" PTEhi="); serial_puthex((uint32_t)(ptv[pt_idx] >> 32));
+                {
+                    uint32_t elo, ehi;
+                    __asm__ volatile("rdmsr" : "=a"(elo), "=d"(ehi) : "c"(0xC0000080));
+                    serial_puts(" EFER="); serial_puthex(ehi); serial_puthex(elo);
                 }
             }
-            serial_puts("\r\n");
         }
+        /* ~~ dump debug: bytes em RIP + PTE alta + EFER (sem ler VA user!) ~~ */
+        if (regs[17] < 0x0000800000000000ULL) {
+            const uint8_t *ipb = (const uint8_t *)regs[17];
+            serial_puts(" OP=");
+            for (int i = 0; i < 6; i++) { serial_puthex(ipb[i]); serial_putc(' '); }
+        }
+            }
+            serial_puts("\r\n");
         /* ~~ DEMAND PAGING (user): região mapeada + página ausente
          * → aloca frame ZERADO na hora, invlpg e RETENTA~~
          * O mallocng escreve em regiões recém-criadas antes do
@@ -251,7 +316,78 @@ void idt_handler(uint64_t *regs) {
                 __asm__ volatile("invlpg (%0)" :: "r"(cr2) : "memory");
                 return;   /* retry da instrução — página viva! */
             }
+            /* ~~ PF user em página PRESENTE: ou é TLB velho (sem PCID a
+             * entrada antiga em U/S antigo sobrevive à troca da PD entry),
+             * ou é algum nível da tabela sem o bit U/S. Garante U no nível
+             * folha + invlpg + retry — limitado, senão vira livelock como
+             * o do XORG em 0x0221EE68 (41k PFs iguais) ~~ */
+            if ((err_code & 1) && ((err_code >> 2) & 1)) {
+                static uint64_t last_cr2 = ~0ULL;
+                static int us_retry = 0;
+                if (cr2 == last_cr2) us_retry++;
+                else { last_cr2 = cr2; us_retry = 0; }
+                if (us_retry < 8) {
+                    uint64_t p4_pa2;
+                    __asm__ volatile("mov %%cr3, %0" : "=r"(p4_pa2));
+                    uint64_t *q4 = (uint64_t *)(uintptr_t)p4_pa2;
+                    int pi2 = (cr2 >> 39) & 0x1FF, qi2 = (cr2 >> 30) & 0x1FF;
+                    int di2 = (cr2 >> 21) & 0x1FF, ti2 = (cr2 >> 12) & 0x1FF;
+                    if ((q4[pi2] & 1) && !(q4[pi2] & 0x80)) {
+                        uint64_t *q3 = (uint64_t *)(uintptr_t)(q4[pi2] & ~0xFFFULL);
+                        if ((q3[qi2] & 1) && !(q3[qi2] & 0x80)) {
+                            uint64_t *q2 = (uint64_t *)(uintptr_t)(q3[qi2] & ~0xFFFULL);
+                            if (q2[di2] & 1) {
+                                /* ~~ Só concede U/S pra frame que É de
+                                 * usuário (mmap_user/ELF) ou pro fb: uma
+                                 * página presente de KERNEL (tabela de
+                                 * página, heap do buddy) tocada em ring 3
+                                 * é violação → mata o processo. Sem esse
+                                 * gate o USFIX desfaz o
+                                 * pml4_add_user_range e o xterm volta a
+                                 * smashear o próprio PD. ~~ */
+                                uint64_t leaf_pa = (q2[di2] & 0x80)
+                                    ? (q2[di2] & 0x000FFFFFE00000ULL)
+                                    : ((q2[di2] & ~0xFFFULL) +
+                                       ((uint64_t)ti2 << 12));
+                                extern framebuffer_t g_fb;
+                                extern int g_fb_active;
+                                int in_fb = g_fb_active && g_fb.addr &&
+                                    cr2 >= g_fb.addr &&
+                                    cr2 - g_fb.addr <
+                                        (uint64_t)g_fb.pitch * g_fb.height;
+                                if (!frame_is_user(leaf_pa) && !in_fb) {
+                                    kill_user_exc(regs, exc_num, "[PF-KILL]");
+                                    return;
+                                }
+                                if (q2[di2] & 0x80) {
+                                    q2[di2] |= 4;                 /* huge page: U/S */
+                                } else {
+                                    uint64_t *q1 = (uint64_t *)(uintptr_t)(q2[di2] & ~0xFFFULL);
+                                    if ((q1[ti2] & 1) && !(q1[ti2] & 4))
+                                        q1[ti2] |= 4;             /* PTE: U/S */
+                                }
+                                __asm__ volatile("invlpg (%0)" :: "r"(cr2) : "memory");
+                                serial_puts("[USFIX] va="); serial_puthex((uint32_t)(cr2 >> 12));
+                                serial_puts(" n="); serial_puthex((uint32_t)us_retry);
+                                serial_puts("\r\n");
+                                return;   /* retry — página viva! */
+                            }
+                        }
+                    }
+                }
+            }
+            if (!(err_code & 1) && ((err_code >> 2) & 1) &&
+                (!me || !me->vm_map || !vm_map_covers(me->vm_map, cr2))) {
+                kill_user_exc(regs, exc_num, "[PF-KILL]");
+                return;
+            }
 pf_dump:;
+    }
+        } else {
+            /* PF não-recuperável veio do ring 3 → mata o processo,
+             * não a máquina (retry cego aqui = livelock/hlt) */
+            if ((regs[18] & 3) == 3)
+                kill_user_exc(regs, exc_num, "[PF-KILL]");
         }
         return;
     }
@@ -296,31 +432,55 @@ pf_dump:;
     serial_puthex((uint32_t)regs[14]);
     serial_puts(" RSP=");
     serial_puthex((uint32_t)regs[20]);
+    /* ~~ dump dos 5 slots do frame de iret (RIP,CS,RFLAGS,RSP,SS) ~~
+     * #GP no iretq = um desses campos é lixo; ver qual ~~ */
+    if (regs[20] > 0x1000 && regs[20] < 0x40000000ULL) {
+        uint64_t *fr = (uint64_t *)(uintptr_t)regs[20];
+        serial_puts(" IRET=");
+        for (int fi = 0; fi < 5; fi++) {
+            serial_puts("[");
+            serial_puthex((uint32_t)(fr[fi] >> 32));
+            serial_puthex((uint32_t)fr[fi]);
+            serial_puts("]");
+        }
+    }
     serial_puts(" CR2=");
     { uint64_t _cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(_cr2)); serial_puthex((uint32_t)_cr2); }
     serial_puts(" !!!\r\n");
     /* ~~ Backtrace: qwords da pilha do processo (retornos de call) ~~ */
     {
         uint64_t sp = regs[20];
-        serial_puts(" STACK:");
-        for (int i = 0; i < 24; i++) {
-            uint64_t v = *(uint64_t *)(uintptr_t)(sp + 8 * i);
-            if (v >= 0x40000000 && v < 0x40600000) {   /* só .text do user */
-                serial_puts(" ");
-                serial_puthex((uint32_t)(sp + 8 * i));
-                serial_puts(":");
-                serial_puthex((uint32_t)v);
+        if (sp < 0x0000800000000000ULL) {
+            serial_puts(" STACK:");
+            for (int i = 0; i < 24; i++) {
+                uint64_t v = *(uint64_t *)(uintptr_t)(sp + 8 * i);
+                if (v >= 0x40000000 && v < 0x40600000) {   /* só .text do user */
+                    serial_puts(" ");
+                    serial_puthex((uint32_t)(sp + 8 * i));
+                    serial_puts(":");
+                    serial_puthex((uint32_t)v);
+                }
             }
+            serial_puts("\r\n");
+        }
+    }
+    if (regs[17] < 0x0000800000000000ULL) {
+        serial_puts(" CODE:");
+        uint8_t *code = (uint8_t *)(uintptr_t)regs[17];
+        for (int i = 0; i < 16; i++) {
+            serial_puthex((uint32_t)code[i]);
+            serial_puts(" ");
         }
         serial_puts("\r\n");
     }
-    serial_puts(" CODE:");
-    uint8_t *code = (uint8_t *)(uintptr_t)regs[17];
-    for (int i = 0; i < 16; i++) {
-        serial_puthex((uint32_t)code[i]);
-        serial_puts(" ");
+    /* ~~ Exceção de ring 3 (EXC#0..31 fora do PF): mata o processo ~~ */
+    if ((regs[18] & 3) == 3)
+        kill_user_exc(regs, exc_num, "[EXC-KILL]");
+    /* FASE5-DBG temporário: EXC de ring 0 → despeja forense do buddy */
+    if ((regs[18] & 3) == 0) {
+        extern void buddy_dump_ring(void);
+        buddy_dump_ring();
     }
-    serial_puts("\r\n");
     for (;;) __asm__ volatile("cli; hlt");
 }
 

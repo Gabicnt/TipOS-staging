@@ -129,10 +129,10 @@ export fn mouse_process_byte(d: u8) void {
             mouse_packet[2] = d;
             mouse_cycle = 0;
             const flags: u8 = mouse_packet[0];
-            var dx: i32 = @as(i32, mouse_packet[1]);
-            var dy: i32 = @as(i32, mouse_packet[2]);
-            if ((flags & 0x10) == 0) dx |= @as(i32, @bitCast(@as(u32, 0xFFFFFF00)));
-            if ((flags & 0x20) == 0) dy |= @as(i32, @bitCast(@as(u32, 0xFFFFFF00)));
+            // Cast direto via i8: extende sinal corretamente sem depender de flag.
+            // O flag 0x10/0x20 eh redundante com o bit7 do dx/dy em modo PS/2.
+            const dx: i32 = @as(i8, @bitCast(mouse_packet[1]));
+            const dy: i32 = @as(i8, @bitCast(mouse_packet[2]));
             mouse_x += dx;
             mouse_y -= dy;
             if (mouse_x < 0) mouse_x = 0;
@@ -169,14 +169,22 @@ export fn mouse_read_delta(dx: *i32, dy: *i32, buttons: *i32) void {
     last_reported_y = mouse_y;
 }
 
-// ~~ mice_avail / mice_read ~~
-// Bytes crus do mouse pro Xorg (/dev/input/mice). Não bloqueia:
-// retorna o que tiver no buffer. O Xorg espera via select()~
+// ~~ mice_avail / mice_read / mice_peek ~~
 export fn mice_avail() i32 {
     if (mice_head != mice_tail) return 1;
     return 0;
 }
-
+export fn mice_avail_count() i32 {
+    if (mice_head >= mice_tail) return @as(i32, @intCast(mice_head - mice_tail));
+    return @as(i32, @intCast(MICE_BUF_SIZE - mice_tail + mice_head));
+}
+export fn mice_peek(off: i32) u8 {
+    if (off < 0) return 0;
+    const a: i32 = mice_avail_count();
+    if (off >= a) return 0;
+    const idx = (mice_tail + @as(usize, @intCast(off))) % MICE_BUF_SIZE;
+    return mice_buf[idx];
+}
 export fn mice_read() u8 {
     if (mice_head == mice_tail) return 0;
     const b = mice_buf[mice_tail];

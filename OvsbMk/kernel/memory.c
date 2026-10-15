@@ -20,14 +20,15 @@
 
 #include "memory.h"
 #include "serial.h"
+#include "process.h"
 #include <stdint.h>
 
-#define HEAP_PHYS    0xA00000u
-#define HEAP_SIZE    (64u * 1024u * 1024u)
+#define HEAP_PHYS    BUDDY_HEAP_PHYS
+#define HEAP_SIZE    BUDDY_HEAP_SIZE
 #define FRAME_SIZE   4096u
 #define FRAME_SHIFT  12u
 #define FRAME_COUNT  (HEAP_SIZE / FRAME_SIZE)
-#define MAX_ORDER    14u
+#define MAX_ORDER    16u
 
 #define FRAME_ALLOC  0x80u
 #define FRAME_USER   0x40u
@@ -103,9 +104,165 @@ static inline size_t addr_to_frame(uint64_t addr) {
     return (addr - HEAP_PHYS) >> FRAME_SHIFT;
 }
 
+/* ~~ watchpoints de frame (fase 7): PAs rastreados. Setados por
+ * pml4_map_phys/clone_identity_tables quando criam o PD da região
+ * 3–4GB. Qualquer alloc/free desses frames imprime [watch] + caller. ~~ */
+uint64_t g_watch_frames[8];
+int g_watch_count = 0;
+void watch_add(uint64_t pa) {
+    for (int i = 0; i < g_watch_count; i++)
+        if (g_watch_frames[i] == pa) return;
+    if (g_watch_count < 8) g_watch_frames[g_watch_count++] = pa;
+}
+static inline void watch_hit(const char *tag, void *ptr) {
+    int hit = 0;
+    for (int i = 0; i < g_watch_count; i++)
+        if (g_watch_frames[i] == (uint64_t)ptr) { hit = 1; break; }
+    if (!hit) return;
+    extern void serial_puts(const char *s);
+    extern void serial_puthex(uint32_t v);
+    serial_puts(tag);
+    serial_puthex((uint32_t)((uint64_t)ptr >> 32));
+    serial_puthex((uint32_t)(uint64_t)ptr);
+    serial_puts(" ret=");
+    serial_puthex((uint32_t)(uint64_t)__builtin_return_address(1));
+    serial_puts("\r\n");
+}
+
 /* ~ simples mas essencial, n mexe sem saber oq ta fazendo */
 static inline uint64_t frame_to_addr(size_t idx) {
     return HEAP_PHYS + (idx << FRAME_SHIFT);
+}
+
+/* FASE5-DBG temporário: anel forense do buddy (quem alocou/liberou o
+ * quê). Descarregado no EXC# de ring 0. Sem serial no caminho quente. */
+uint64_t dbg_target_pa = 0;
+#define BUDDY_RING_N 2048
+struct buddy_ev { uint64_t addr; uint64_t ret; uint8_t op; uint8_t ord; };
+static struct buddy_ev buddy_ring[BUDDY_RING_N];
+static unsigned buddy_ring_i = 0;
+static inline void buddy_log(uint8_t op, int ord, uint64_t addr) {
+    unsigned i = buddy_ring_i++ & (BUDDY_RING_N - 1);
+    buddy_ring[i].op = op;
+    buddy_ring[i].ord = (uint8_t)ord;
+    buddy_ring[i].addr = addr;
+    buddy_ring[i].ret = (uint64_t)__builtin_return_address(0);
+}
+void buddy_dump_ring(void) {
+    extern void serial_puts(const char *s);
+    extern void serial_puthex(uint32_t v);
+    extern free_block_t *free_area[];
+    serial_puts("[bring] ultimas 48 ops (op 1=alloc 0=free):\r\n");
+    unsigned n = buddy_ring_i < 48 ? buddy_ring_i : 48;
+    for (unsigned k = 0; k < n; k++) {
+        unsigned i = (buddy_ring_i - 1 - k) & (BUDDY_RING_N - 1);
+        serial_puts(k == 0 ? "  +" : "  -");
+        serial_puthex(k);
+        serial_puts(k ? " " : " ");
+        serial_puts(buddy_ring[i].op ? "A" : "F");
+        serial_puthex(buddy_ring[i].ord);
+        serial_puts(" @"); serial_puthex((uint32_t)buddy_ring[i].addr);
+        serial_puts(" ret="); serial_puthex((uint32_t)buddy_ring[i].ret);
+        serial_puts("\r\n");
+    }
+    serial_puts("[bring] free_area heads:\r\n");
+    for (int o = 0; o <= 16; o++) {
+        free_block_t *h = free_area[o];
+        if (!h) continue;
+        serial_puts("  ord="); serial_puthex((uint32_t)o);
+        serial_puts(" head="); serial_puthex((uint32_t)(uintptr_t)h);
+        serial_puts(" next="); serial_puthex(h->next ? (uint32_t)(uintptr_t)h->next : 0);
+        serial_puts(" prev="); serial_puthex(h->prev ? (uint32_t)(uintptr_t)h->prev : 0);
+        serial_puts("\r\n");
+    }
+    /* FASE5-DBG: quem mapeia o frame 0 (0xA00000)? varre as tabelas do
+     * CR3 atual procurando folha == 0xA00000 com U/S. */
+    {
+        extern uint64_t dbg_target_pa;
+        uint64_t target = dbg_target_pa ? dbg_target_pa : 0xA00000ULL;
+        serial_puts("[bring] scan pa="); serial_puthex((uint32_t)target);
+        serial_puts("\r\n");
+        /* quadros 0..15 do bitmap + conteúdo do frame 0 */
+        {
+            extern uint8_t frames[];
+            for (int fi = 0; fi < 8; fi++) {
+                serial_puts(" f"); serial_puthex((uint32_t)fi);
+                serial_puts("="); serial_puthex((uint32_t)frames[fi]);
+            }
+            serial_puts("\r\n");
+            volatile uint64_t *fz = (volatile uint64_t *)(uintptr_t)target;
+            serial_puts(" frame0:"); serial_puthex((uint32_t)fz[0]);
+            serial_puts(" "); serial_puthex((uint32_t)fz[1]);
+            serial_puts(" "); serial_puthex((uint32_t)fz[2]);
+            serial_puts(" "); serial_puthex((uint32_t)fz[3]);
+            serial_puts("\r\n");
+        }
+        /* lista ord-14 inteira (cabeca + 7) */
+        {
+            int shown = 0;
+            free_block_t *nd = free_area[14];
+            while (nd && shown < 8) {
+                serial_puts(" nd="); serial_puthex((uint32_t)(uintptr_t)nd);
+                /* link valido? dentro da RAM e alinhado */
+                uint64_t nn = (uint64_t)(uintptr_t)nd->next;
+                uint64_t np = (uint64_t)(uintptr_t)nd->prev;
+                if (nn < BUDDY_HEAP_PHYS || nn >= (uint64_t)BUDDY_HEAP_PHYS + BUDDY_HEAP_SIZE || (nn & 0xFFFULL)) break;
+                if (np < BUDDY_HEAP_PHYS || np >= (uint64_t)BUDDY_HEAP_PHYS + BUDDY_HEAP_SIZE || (np & 0xFFFULL)) {
+                    serial_puts(" POISON");
+                    serial_puts("\r\n");
+                    break;
+                }
+                nd = nd->next;
+                shown++;
+            }
+            serial_puts(" lista-fim\r\n");
+        }
+        /* varre TODOS os processos (não só o CR3 atual) */
+        for (int ps = 0; ps < MAX_PROC; ps++) {
+            if (pcb_table[ps].state == PROC_EMPTY) continue;
+            uint64_t *p4 = (uint64_t *)(uintptr_t)pcb_table[ps].pml4;
+            if (!p4) continue;
+            serial_puts(" pid="); serial_puthex((uint32_t)pcb_table[ps].pid);
+            serial_puts("\r\n");
+            for (int i4 = 0; i4 < 512; i4++) {
+            uint64_t e4 = p4[i4];
+            if (!(e4 & 1)) continue;
+            uint64_t *p3 = (uint64_t *)(uintptr_t)(e4 & 0x000FFFFFFFFFF000ULL);
+            for (int i3 = 0; i3 < 512; i3++) {
+                uint64_t e3 = p3[i3];
+                if (!(e3 & 1) || (e3 & 0x80)) continue;
+                uint64_t *p2 = (uint64_t *)(uintptr_t)(e3 & 0x000FFFFFFFFFF000ULL);
+                for (int i2 = 0; i2 < 512; i2++) {
+                    uint64_t e2 = p2[i2];
+                    if (!(e2 & 1)) continue;
+                    if (e2 & 0x80) {
+                        if ((e2 & 0x000FFFFFE00000ULL) <= target &&
+                            target < ((e2 & 0x000FFFFFE00000ULL) + 0x200000)) {
+                            uint64_t va = ((uint64_t)i4 << 39) | ((uint64_t)i3 << 30) | ((uint64_t)i2 << 21);
+                            serial_puts("  HUGE va="); serial_puthex((uint32_t)va);
+                            serial_puts(" e="); serial_puthex((uint32_t)e2);
+                            serial_puts("\r\n");
+                        }
+                        continue;
+                    }
+                    uint64_t *p1 = (uint64_t *)(uintptr_t)(e2 & 0x000FFFFFFFFFF000ULL);
+                    for (int i1 = 0; i1 < 512; i1++) {
+                        uint64_t e1 = p1[i1];
+                        if ((e1 & 1) && (e1 & 4) &&
+                            (e1 & 0x000FFFFFFFFFF000ULL) == target) {
+                            uint64_t va = ((uint64_t)i4 << 39) | ((uint64_t)i3 << 30) |
+                                          ((uint64_t)i2 << 21) | ((uint64_t)i1 << 12);
+                            serial_puts("  USE va="); serial_puthex((uint32_t)va);
+                            serial_puts(" e="); serial_puthex((uint32_t)e1);
+                            serial_puts("\r\n");
+                        }
+                    }
+                    }
+                }
+            }
+        }
+        serial_puts("[bring] scan fim\r\n");
+    }
 }
 
 /* ~ kyun~ mais uma funcao pra fazer o kernel n morrer */
@@ -126,19 +283,61 @@ static void list_remove(free_block_t **head, free_block_t *blk) {
         blk->next->prev = blk->prev;
 }
 
+/* FASE5: bloco 100% livre? (sem ALLOC nem USER em nenhum frame).
+ * Sub-frames de blocos vivos sempre carregam ALLOC (ver alloc
+ * abaixo) — sem isso um vizinho "velho" parecia livre e o split
+ * anotava/linkava por cima de memória viva. */
+static int block_is_free(size_t block_idx, int order) {
+    size_t n = 1UL << order;
+    if (block_idx + n > FRAME_COUNT) return 0;
+    for (size_t k = 0; k < n; k++) {
+        uint8_t f = frames[block_idx + k];
+        if (f & (FRAME_ALLOC | FRAME_USER)) return 0;
+    }
+    return 1;
+}
+
 /* ~ simples mas essencial, n mexe sem saber oq ta fazendo */
 static void *buddy_alloc(int order, int user) {
     if (order < 0 || order > MAX_ORDER) return NULL;
     mem_lock();
     int found_order = -1;
+    free_block_t *block = NULL;
+    size_t block_idx = 0;
+    /* FASE5: pega o primeiro bloco da ordem que estiver 100% livre e
+     * alinhado (pula links podres / blocos contaminados em vez de
+     * confiar cegamente na cabeça da lista). */
     for (int o = order; o <= MAX_ORDER; o++) {
-        if (free_area[o]) { found_order = o; break; }
+        int scanned = 0;
+        free_block_t *b = free_area[o];
+        while (b) {
+            if (++scanned > 8192) break;   /* lista podre: desiste */
+            uint64_t ba = (uint64_t)b;
+            /* ponteiro fora do heap/alinhamento = lista podre além
+             * daqui: PARA (ler b->next disso daria #PF em ring 0). */
+            if (ba < HEAP_PHYS || ba >= HEAP_PHYS + HEAP_SIZE ||
+                (ba & (FRAME_SIZE - 1))) break;
+            /* links precisam ser sãos (cabeça: prev NULL + next NULL
+             * ou frame alinhado do heap): list_remove por link podre
+             * escreve em endereço selvagem (#GP). */
+            uint64_t bn = (uint64_t)(uintptr_t)b->next;
+            uint64_t bp = (uint64_t)(uintptr_t)b->prev;
+            int link_ok = !bp &&
+                (!bn || (bn >= HEAP_PHYS && bn < HEAP_PHYS + HEAP_SIZE && !(bn & 0xFFFULL)));
+            size_t bi = addr_to_frame(ba);
+            if (link_ok && ((bi >> o) << o) == bi && block_is_free(bi, o)) {
+                found_order = o;
+                block = b;
+                block_idx = bi;
+                break;
+            }
+            if (!link_ok) break;   /* resto da lista incoerente: próxima ordem */
+            b = b->next;
+        }
+        if (block) break;
     }
-    if (found_order < 0) { serial_puts("ba: no free\r\n"); mem_unlock(); return NULL; }
-
-    free_block_t *block = free_area[found_order];
+    if (!block) { serial_puts("ba: no free\r\n"); mem_unlock(); buddy_log(1, order, 0); return NULL; }
     list_remove(&free_area[found_order], block);
-    size_t block_idx = addr_to_frame((uint64_t)block);
 
     for (int o = found_order; o > order; o--) {
         size_t buddy_idx = block_idx ^ (1UL << (o - 1));
@@ -148,23 +347,78 @@ static void *buddy_alloc(int order, int user) {
     }
 
     frames[block_idx] = (uint8_t)(order | FRAME_ALLOC);
-    if (user) frames[block_idx] |= FRAME_USER;
+    /* FASE5: marca ALLOC|USER em TODOS os frames do bloco (ordem só na
+     * cabeça). Antes os sub-frames ficavam com order velha sem ALLOC:
+     * pareciam livres pra coalescência/split e o buddy anotava por
+     * cima de memória viva. (frame_is_user continua valendo p/ USER.) */
+    for (size_t k = 0; k < (1UL << order); k++)
+        frames[block_idx + k] = (uint8_t)(FRAME_ALLOC | FRAME_USER);
+    frames[block_idx] = (uint8_t)(order | FRAME_ALLOC | FRAME_USER);
+    if (!user) {
+        for (size_t k = 0; k < (1UL << order); k++)
+            frames[block_idx + k] &= (uint8_t)~FRAME_USER;
+    }
     mem_unlock();
-    return (void *)frame_to_addr(block_idx);
+    {
+        void *res = (void *)frame_to_addr(block_idx);
+        watch_hit("[watch] buddy-alloc ", res);
+        buddy_log(1, order, (uint64_t)(uintptr_t)res);
+        return res;
+    }
 }
 
 /* ~ essa funcao aqui e a mais importante, presta atencao baka! */
 static void buddy_free(void *addr, int order) {
     if (!addr || order < 0 || order > MAX_ORDER) return;
     uint64_t phys = (uint64_t)addr;
+    watch_hit("[watch] buddy-free ", addr);
     if (phys < HEAP_PHYS || phys >= HEAP_PHYS + HEAP_SIZE) return;
     if (phys & (FRAME_SIZE - 1)) return;
+    buddy_log(0, order, (uint64_t)phys);
+    /* ~~ debug fase 7: devolvendo pra buddy um frame que ainda é de
+     * SLAB ou está no pool pcpu? = double-free → a página vira kstack
+     * por cima de slab vivo e a freelist vira lixo (0x23). ~~ */
+    {
+        static int dfc;
+        if (dfc < 8) {
+            int hit = 0;
+            for (unsigned ci = 0; ci < CACHE_COUNT && !hit; ci++)
+                for (slab_t *sl = kmalloc_caches[ci].slabs; sl && !hit; sl = sl->next)
+                    if ((uint64_t)sl == phys) hit = 1;
+            if (!hit)
+                for (int pi = 0; pi < pcpu_pages.count && !hit; pi++)
+                    if ((uint64_t)pcpu_pages.pages[pi] == phys) hit = 1;
+            if (hit) {
+                extern void serial_puthex(uint32_t v);
+                dfc++;
+                serial_puts("[BUD-FREE-LIVE] pa="); serial_puthex((uint32_t)phys);
+                serial_puts(" ord="); serial_puthex((uint32_t)order);
+                serial_puts(" ret="); serial_puthex((uint32_t)(uint64_t)__builtin_return_address(0));
+                serial_puts("\r\n");
+            }
+        }
+    }
     mem_lock();
     size_t idx = addr_to_frame(phys);
     frames[idx] = (uint8_t)order;
+    /* FASE5: limpa as marcas dos sub-frames do bloco (ALLOC|USER de
+     * quando estava vivo). Sem isso eles pareciam "vivos" pra sempre:
+     * nada voltava a coalescer e o pool fragmentava até o primeiro
+     * alloc grande falhar (kmalloc de 8MB do FOOT travava o boot). */
+    {
+        size_t n = 1UL << order;
+        if (idx + n <= FRAME_COUNT)
+            for (size_t k = 1; k < n; k++) frames[idx + k] = 0;
+    }
     while (order < MAX_ORDER) {
         size_t buddy_idx = idx ^ (1UL << order);
-        if ((frames[buddy_idx] & (FRAME_ALLOC | FRAME_ORDER)) == (uint8_t)order) {
+        /* FASE5: o vizinho precisa estar LIVRE de verdade (sem ALLOC e
+         * sem USER, ordem igual). Sub-frames de blocos vivos carregam
+         * order velha + USER (o alloc só marca a cabeça com ALLOC) —
+         * sem o gate USER, o merge engolia página viva pra freelist
+         * (munmap em massa do fontconfig no foot) e o próximo alloc
+         * grande tropeçava em links com bytes de usuário (#GP). */
+        if ((frames[buddy_idx] & (FRAME_ALLOC | FRAME_USER | FRAME_ORDER)) == (uint8_t)order) {
             free_block_t *buddy = (free_block_t *)frame_to_addr(buddy_idx);
             list_remove(&free_area[order], buddy);
             idx = (idx < buddy_idx) ? idx : buddy_idx;
@@ -186,6 +440,28 @@ static void *slab_alloc(kmem_cache_t *cache) {
     while (s) {
         if (s->freelist) {
             void *obj = s->freelist;
+            /* ~~ debug fase 7: freelist aponta pra FORA da página do slab? ~~ */
+            if (((uint64_t)obj & ~0xFFFULL) != (uint64_t)s) {
+                extern void serial_puts(const char *s);
+                extern void serial_puthex(uint32_t v);
+                serial_puts("[SLAB-BAD] slab="); serial_puthex((uint32_t)s);
+                serial_puts(" free="); serial_puthex((uint32_t)obj);
+                serial_puts(" cid="); serial_puthex((uint32_t)cache->id);
+                serial_puts(" ret0="); serial_puthex((uint32_t)(uint64_t)__builtin_return_address(0));
+                serial_puts(" ret1="); serial_puthex((uint32_t)(uint64_t)__builtin_return_address(1));
+                serial_puts("\r\n  chain:");
+                { int n = 0; slab_t *w = cache->slabs;
+                  while (w && n < 16) {
+                      serial_puts(" "); serial_puthex((uint32_t)w);
+                      serial_puts(":"); serial_puthex(w->magic);
+                      w = w->next; n++; }
+                  if (w) serial_puts(" ...LOOP/OVF");
+                }
+                serial_puts("\r\n");
+                s->freelist = NULL;
+                s = s->next;
+                continue;
+            }
             s->freelist = *(void **)obj;
             s->in_use++;
             return obj;
@@ -242,13 +518,19 @@ static void slab_free(void *ptr) {
 
 /* ~ kyun~ mais uma funcao pra fazer o kernel n morrer */
 static void *pcpu_page_alloc(void) {
-    if (pcpu_pages.count > 0)
-        return pcpu_pages.pages[--pcpu_pages.count];
-    return buddy_alloc(0, 0);
+    if (pcpu_pages.count > 0) {
+        void *p = pcpu_pages.pages[--pcpu_pages.count];
+        watch_hit("[watch] pcpu-alloc ", p);
+        return p;
+    }
+    void *p = buddy_alloc(0, 0);
+    watch_hit("[watch] pcpu-alloc(buddy) ", p);
+    return p;
 }
 
 /* ~ essa funcao aqui e a mais importante, presta atencao baka! */
 static void pcpu_page_free(void *p) {
+    watch_hit("[watch] pcpu-free ", p);
     if (pcpu_pages.count < PCPU_PAGE_POOL)
         pcpu_pages.pages[pcpu_pages.count++] = p;
     else
@@ -260,8 +542,23 @@ static void pcpu_page_free(void *p) {
 /* ~ essa funcao aqui e a mais importante, presta atencao baka! */
 static void *pcpu_slab_alloc(kmem_cache_t *cache) {
     int id = cache->id;
-    if (pcpu_objects[id].count > 0)
-        return pcpu_objects[id].objs[--pcpu_objects[id].count];
+    if (pcpu_objects[id].count > 0) {
+        void *o = pcpu_objects[id].objs[--pcpu_objects[id].count];
+        /* ~~ debug fase 7: objeto do pcpu cuja página não é mais slab? ~~ */
+        {
+            slab_t *os = (slab_t *)((uint64_t)o & ~(FRAME_SIZE - 1));
+            if (os->magic != SLAB_MAGIC || os->cache != cache) {
+                extern void serial_puts(const char *s);
+                extern void serial_puthex(uint32_t v);
+                serial_puts("[PCPU-POISON] obj="); serial_puthex((uint32_t)o);
+                serial_puts(" magic="); serial_puthex(os->magic);
+                serial_puts(" id="); serial_puthex(id);
+                serial_puts(" ret="); serial_puthex((uint32_t)(uint64_t)__builtin_return_address(0));
+                serial_puts("\r\n");
+            }
+        }
+        return o;
+    }
     void *obj = slab_alloc(cache);
     if (!obj) return NULL;
     /* refill: grab extra objects from same slab */
@@ -315,6 +612,29 @@ static void pcpu_slab_free(void *ptr, slab_t *s) {
     }
 }
 
+/* ~~ free_range ~ adiciona o intervalo [start,end) (índices de frame) na
+ * buddy em blocos alinhados à maior potência de 2 que couber. O
+ * memory_init usa isso pra esculpir a imagem do kernel FORA do heap ~~ */
+static void free_range(size_t start, size_t end) {
+    while (start < end) {
+        int order = 0;
+        for (int o = MAX_ORDER; o >= 0; o--) {
+            size_t sz = 1UL << o;
+            if (sz <= end - start && (start & (sz - 1)) == 0) {
+                order = o;
+                break;
+            }
+        }
+        size_t sz = 1UL << order;
+        frames[start] = (uint8_t)order;
+        free_block_t *blk = (free_block_t *)frame_to_addr(start);
+        blk->next = NULL;
+        blk->prev = NULL;
+        list_add(&free_area[order], blk);
+        start += sz;
+    }
+}
+
 /* ~~ Inicializando~~ torce pra não dar panic! */
 /* ~ cuidado que essa aqui morde ~ */
 void memory_init(void) {
@@ -323,11 +643,24 @@ void memory_init(void) {
         free_area[i] = NULL;
     for (size_t i = 0; i < FRAME_COUNT; i++)
         frames[i] = 0;
-    free_block_t *block = (free_block_t *)(uint64_t)HEAP_PHYS;
-    block->next = NULL;
-    block->prev = NULL;
-    free_area[MAX_ORDER] = block;
-    frames[0] = MAX_ORDER;
+    /* ~~ RESERVA A IMAGEM DO KERNEL ~~
+     * O heap buddy [0xA00000..0x1FE00000) COBRE o kernel em 0x08000000!
+     * Sem essa reserva, estourados os ~118MB baixos (Xorg+fvwm2+xterm+
+     * fork eager), o buddy entregava frames do PRÓPRIO .text: o
+     * buddy_alloc gravou a freelist em 0x08004000 — por cima das
+     * instruções que estava executando → PF em loop (RIP=0x0800400E). ~~ */
+    {
+        extern char __bss_end[];
+        uint64_t kstart = 0x08000000;
+        uint64_t kend = ((uint64_t)(uintptr_t)__bss_end + 0xFFFULL) & ~0xFFFULL;
+        size_t k0 = (size_t)((kstart - HEAP_PHYS) >> FRAME_SHIFT);
+        size_t k1 = (size_t)((kend - HEAP_PHYS) >> FRAME_SHIFT);
+        if (k1 > FRAME_COUNT) k1 = FRAME_COUNT;
+        for (size_t ki = k0; ki < k1; ki++)
+            frames[ki] = (uint8_t)(FRAME_ALLOC | 0x20); /* ordem 32 > MAX: buddy_free recusa */
+        free_range(0, k0);
+        free_range(k1, FRAME_COUNT);
+    }
     static const size_t sizes[CACHE_COUNT] = {
         16, 32, 64, 128, 256, 512, 1024, 2048
     };
@@ -371,6 +704,39 @@ void kfree(void *ptr) {
     slab_t *s = (slab_t *)(addr & ~(FRAME_SIZE - 1));
     if (s->magic == SLAB_MAGIC) {
         if (s->cache) {
+            /* ~~ debug fase 7: valida o cache antes de indexar pcpu_objects
+             * (id fora de 0..7 escrevia FORA do array e corrompia o BSS) ~~ */
+            kmem_cache_t *cchk = s->cache;
+            if ((uint64_t)cchk < (uint64_t)kmalloc_caches ||
+                (uint64_t)cchk >= (uint64_t)&kmalloc_caches[CACHE_COUNT]) {
+                extern void serial_puthex(uint32_t v);
+                serial_puts("[SLAB-BADID] ptr="); serial_puthex((uint32_t)ptr);
+                serial_puts(" cache="); serial_puthex((uint32_t)(uint64_t)cchk);
+                serial_puts(" ret="); serial_puthex((uint32_t)(uint64_t)__builtin_return_address(0));
+                serial_puts("\r\n");
+                return;
+            }
+            int id = cchk->id;
+            if (id < 0 || id >= (int)CACHE_COUNT) {
+                extern void serial_puthex(uint32_t v);
+                serial_puts("[SLAB-BADID] ptr="); serial_puthex((uint32_t)ptr);
+                serial_puts(" cache="); serial_puthex((uint32_t)(uint64_t)s->cache);
+                serial_puts(" id="); serial_puthex((uint32_t)id);
+                serial_puts(" ret="); serial_puthex((uint32_t)(uint64_t)__builtin_return_address(0));
+                serial_puts("\r\n");
+                return;
+            }
+            /* dup free no pcpu? (dois donos do mesmo objeto → alias) */
+            for (int di = 0; di < pcpu_objects[id].count; di++) {
+                if (pcpu_objects[id].objs[di] == ptr) {
+                    extern void serial_puthex(uint32_t v);
+                    serial_puts("[KFREE-DUP] ptr="); serial_puthex((uint32_t)ptr);
+                    serial_puts(" id="); serial_puthex((uint32_t)id);
+                    serial_puts(" ret="); serial_puthex((uint32_t)(uint64_t)__builtin_return_address(0));
+                    serial_puts("\r\n");
+                    return;
+                }
+            }
             pcpu_slab_free(ptr, s);
             return;
         }
@@ -411,6 +777,22 @@ void *kcalloc(size_t count, size_t size) {
     return p;
 }
 
+/* ~~ page_frame_kernel ~~
+ * Frame pra TABELA de página (PD/PDP/PDPT/PT). NÃO é memória de
+ * usuário: se saísse do mmap_user (FRAME_USER), o fork copiava a
+ * tabela como se fosse dado e REBINDAVA o PTE do filho pro frame
+ * cópia — o kernel passava a editar uma sombra enquanto o hardware
+ * caminhava na tabela original → heap/slab divergiam e o kmalloc
+ * engolia lixo (freelist 0x23 → #GP em ring 0 no xterm). ~~ */
+void *page_frame_kernel(void) {
+    uint8_t *p = (uint8_t *)pcpu_page_alloc();
+    /* ~~ ZERA: antes usávamos mmap_user (que zera). Sem isso as tabelas
+     * herdavam lixo do pool — new_pdp pulava entradas ausentes com
+     * `continue` e o filho ficava com PDP sujo → triple fault no fork. ~~ */
+    if (p) for (size_t i = 0; i < 4096; i++) p[i] = 0;
+    return p;
+}
+
 /* ~ simples mas essencial, n mexe sem saber oq ta fazendo */
 void *mmap_user(void *addr, size_t length, int prot, int flags) {
     (void)addr; (void)prot; (void)flags;
@@ -430,12 +812,49 @@ void *mmap_user(void *addr, size_t length, int prot, int flags) {
     return result;
 }
 
+/* ~~ frame_is_user ~~ 1 se o frame veio de alocação de USUÁRIO
+ * (mmap_user). O fork copia só esses: memória de kernel (heap kmalloc,
+ * kstack, tabelas) é idêntica nos dois processos de verdade. */
+int frame_is_user(uint64_t pa) {
+    /* FASE5: o índice precisa descontar HEAP_PHYS como addr_to_frame
+     * faz (buddy gerencia [HEAP_PHYS, HEAP_PHYS+HEAP_SIZE)). Sem isso
+     * líamos o slot de outro frame (+10MB de deslocamento): página de
+     * usuário virava "kernel" aleatoriamente → o fork COMPARTILHAVA a
+     * stack em vez de copiar → pai e filho pisavam na mesma pilha
+     * (*** stack smashing detected *** no fork do foot/FORK_TEST). */
+    if (pa < HEAP_PHYS) return 0;
+    size_t idx = (size_t)((pa - HEAP_PHYS) >> FRAME_SHIFT);
+    if (idx >= FRAME_COUNT) return 0;
+    return (frames[idx] & FRAME_USER) ? 1 : 0;
+    /* ~~ O back-scan de 16 frames foi REMOVIDO: ele marcava como
+     * "user" qualquer frame vizinho de uma alocação user (slab logo
+     * após uma página mmap_user) — o fork copiava PÁGINA DE HEAP DO
+     * KERNEL e rebindava o PTE do filho pro frame sombra → corrupção
+     * da freelist do kmalloc (xterm morria com #GP). buddy_alloc já
+     * marca todos os frames do bloco, então o back-scan é inútil. ~~ */
+}
+
 /* ~~ munmap_user ~~ */
 /* ~ kyun~ mais uma funcao pra fazer o kernel n morrer */
 int munmap_user(void *addr, size_t length) {
     (void)length;
     if (!addr) return 0;
     uint64_t a = (uint64_t)addr;
+    watch_hit("[watch] munmap-user ", addr);
+    /* FASE5: cap de log (era 1 linha por página liberada — junto com
+     * [CLR] era 97% do serial do boot). */
+    {
+        static int nmu = 0;
+        if (nmu < 30) {
+            nmu++;
+            extern void serial_puts(const char *s);
+            extern void serial_puthex(uint32_t v);
+            serial_puts("[munmap-user] pa="); serial_puthex((uint32_t)a);
+            serial_puts(" ret=");
+            serial_puthex((uint32_t)(uint64_t)__builtin_return_address(0));
+            serial_puts("\r\n");
+        }
+    }
     if (a & (FRAME_SIZE - 1)) return -1;
     size_t idx = addr_to_frame(a);
     if (idx >= FRAME_COUNT) return -1;
@@ -525,6 +944,15 @@ int pml4_add_user(uint64_t pml4_pa, uint64_t vaddr) {
         pd[pd_idx] = phys | 0x87;
     } else {
         pd[pd_idx] |= 0x04;
+        /* ~~ PDE dividido em 4KB: U/S só no ponteiro da PT não basta —
+         * o acesso user depende também do U/S de CADA PTE. Marca os 512
+         * (mesma semântica de quando a entrada era 2MB huge). Sem isso
+         * o stack do execve em VA identity dava PF em ring 3. ~~ */
+        if (!(pd[pd_idx] & 0x80)) {
+            uint64_t *pt = (uint64_t *)(uintptr_t)(pd[pd_idx] & ~0xFFFULL);
+            for (int i2 = 0; i2 < 512; i2++)
+                if (pt[i2] & 1) pt[i2] |= 0x04;
+        }
     }
     return 0;
 }
@@ -550,7 +978,7 @@ int split_2mb_pde(uint64_t pml4_pa, uint64_t vaddr) {
     if (!(pde & 0x80)) return 0;  // Already 4KB pages, nothing to do
 
     /* Allocate a 4KB page table */
-    uint64_t *pt = mmap_user(0, 4096, 3, 0);
+    uint64_t *pt = page_frame_kernel();
     if (!pt) return -1;
 
     uint64_t phys_base = pde & ~0x1FFFFFULL;
@@ -572,6 +1000,34 @@ int split_2mb_pde(uint64_t pml4_pa, uint64_t vaddr) {
     /* Fine-grained: set U/S on a single 4KB page within a PD entry.
      * Splits the 2MB huge page first if necessary. */
 /* ~ essa demorou pra debugar, respeita ~ */
+/* ~~ pml4_add_user_range ~ marca U/S só nas PÁGINAS de 4KB em
+ * [lo,hi). Diferente do pml4_add_user (janela INTEIRA de 2MB), não
+ * expõe os objetos de kernel que dividem a mesma janela identity
+ * (tabelas de página e frames do buddy moram junto com o stack do
+ * user): o Xterm escrevia ~42KB abaixo da própria pilha e
+ * SMASHEAVA o page directory do próprio processo (fork-bad). ~~ */
+int pml4_add_user_range(uint64_t pml4_pa, uint64_t lo, uint64_t hi) {
+    if (hi <= lo) return -1;
+    uint64_t *pml4 = (uint64_t *)(uintptr_t)pml4_pa;
+    for (uint64_t va = lo & ~0xFFFULL; va < hi; va += 0x1000) {
+        int i4 = (va >> 39) & 0x1FF;
+        int i3 = (va >> 30) & 0x1FF;
+        int i2 = (va >> 21) & 0x1FF;
+        int i1 = (va >> 12) & 0x1FF;
+        if (!(pml4[i4] & 1)) return -1;
+        uint64_t *pdpt = (uint64_t *)(uintptr_t)(pml4[i4] & ~0xFFFULL);
+        if (!(pdpt[i3] & 1)) return -1;
+        if (split_2mb_pde(pml4_pa, va) < 0) return -1;
+        uint64_t *pd = (uint64_t *)(uintptr_t)(pdpt[i3] & ~0xFFFULL);
+        if (!(pd[i2] & 1)) return -1;
+        pd[i2] |= 0x04;                  /* U/S no nível de tabela (walk) */
+        uint64_t *pt = (uint64_t *)(uintptr_t)(pd[i2] & ~0xFFFULL);
+        pt[i1] |= 0x04;                  /* U/S só na página pedida */
+    }
+    __asm__ volatile("invlpg (%0)" :: "r"(lo) : "memory");
+    return 0;
+}
+
 int pml4_add_user_4kb(uint64_t pml4_pa, uint64_t vaddr) {
     if (split_2mb_pde(pml4_pa, vaddr & ~0x1FFFFFULL) < 0) return -1;
     int pml4_idx = (vaddr >> 39) & 0x1FF;
@@ -591,8 +1047,10 @@ int pml4_add_user_4kb(uint64_t pml4_pa, uint64_t vaddr) {
 
 /* ~~ map_user_4kb ~ Mapeia 1 página de 4KB (frame novo) num espaço de processo ~~
  * Cria as tabelas (pml4/pdpt/pd/PT) que faltarem e aloca um frame físico
- * novo pro endereço, com U/S + RW (0x07). Se a página já estiver mapeada
- * (huge page ou 4KB), não mexe em nada e retorna 0~
+ * novo pro endereço, com U/S + RW (0x07). Se a página 4KB já estiver
+ * mapeada, não mexe em nada e retorna 0. Se cair numa huge page de
+ * KERNEL (identity supervisor herdada), divide via split_2mb_pde e o
+ * PTE pedido ganha frame fresco (Fase 4d: brk do foot passou de 2MB)~
  * (pro brk do musl crescer o heap — antes o handler só mudava o valor
  *  e o processo tomava PF ao escrever nas páginas novas~ rssrsrs) */
 int map_user_4kb(uint64_t pml4_pa, uint64_t va) {
@@ -603,28 +1061,43 @@ int map_user_4kb(uint64_t pml4_pa, uint64_t va) {
 
     uint64_t *pml4 = (uint64_t *)(uintptr_t)pml4_pa;
     if (!(pml4[pml4_idx] & 1)) {
-        uint64_t *pdpt = mmap_user(0, 4096, 3, 0);
+        uint64_t *pdpt = page_frame_kernel();
         if (!pdpt) return -1;
         for (int i = 0; i < 512; i++) pdpt[i] = 0;
         pml4[pml4_idx] = (uint64_t)(uintptr_t)pdpt | 0x07;
     }
     uint64_t *pdpt = (uint64_t *)(uintptr_t)(pml4[pml4_idx] & ~0xFFFULL);
     if (!(pdpt[pdpt_idx] & 1)) {
-        uint64_t *pd = mmap_user(0, 4096, 3, 0);
+        uint64_t *pd = page_frame_kernel();
         if (!pd) return -1;
         for (int i = 0; i < 512; i++) pd[i] = 0;
         pdpt[pdpt_idx] = (uint64_t)(uintptr_t)pd | 0x07;
     }
     uint64_t *pd = (uint64_t *)(uintptr_t)(pdpt[pdpt_idx] & ~0xFFFULL);
-    if (pd[pd_idx] & 0x80) return 0;            /* huge page já mapeada~ */
+    if (pd[pd_idx] & 0x80) {
+        /* ~~ huge page no caminho do brk/mmap (Fase 4d: foot cresceu o
+         * heap até 0xC15000 e morreu em wayl_flush+0x72 — PDE 6 era a
+         * identity supervisor 0xC00083 herdada do mapa low do kernel,
+         * e o PF foi negado pelo gate do USFIX no idt.c).
+         * Huge que já é de usuário: mantém (conteúdo é do processo).
+         * Huge de kernel: divide (split_2mb_pde, padrão do fork); os
+         * PTEs pedidos ganham frame FRESCO no teste abaixo — nunca
+         * U/S em RAM de kernel. ~~ */
+        if (pd[pd_idx] & 0x04) return 0;        /* huge de user: mantém~ */
+        if (split_2mb_pde(pml4_pa, va) < 0) return -1;
+        pd = (uint64_t *)(uintptr_t)(pdpt[pdpt_idx] & ~0xFFFULL);
+    }
     if (!(pd[pd_idx] & 1)) {
-        uint64_t *pt = mmap_user(0, 4096, 3, 0);
+        uint64_t *pt = page_frame_kernel();
         if (!pt) return -1;
         for (int i = 0; i < 512; i++) pt[i] = 0;
         pd[pd_idx] = (uint64_t)(uintptr_t)pt | 0x07;
     }
     uint64_t *pt = (uint64_t *)(uintptr_t)(pd[pd_idx] & ~0xFFFULL);
-    if (pt[pt_idx] & 1) return 0;               /* 4KB já mapeada~ */
+    /* ~~ PTE presente MAS supervisor (= resto identity pós-split, que
+     * ring 3 nunca conseguiu ler) também ganha frame fresco: só PTE
+     * com U/S é "já mapeada" de verdade. ~~ */
+    if ((pt[pt_idx] & 1) && (pt[pt_idx] & 0x04)) return 0;
     uint64_t *frame = mmap_user(0, 4096, 3, 0);
     if (!frame) return -1;
     pt[pt_idx] = (uint64_t)(uintptr_t)frame | 0x07;
@@ -653,17 +1126,26 @@ int pml4_map_phys(uint64_t pml4_pa, uint64_t virt_addr, uint64_t phys_addr,
         int pdpt_idx = (va >> 30) & 0x1FF;
         int pd_idx   = (va >> 21) & 0x1FF;
         if (!(pml4[pml4_idx] & 1)) {
-            uint64_t *pdpt = mmap_user(0, 4096, 3, 0);
+            uint64_t *pdpt = page_frame_kernel();
             if (!pdpt) return -1;
             for (int i = 0; i < 512; i++) pdpt[i] = 0;
             pml4[pml4_idx] = (uint64_t)(uintptr_t)pdpt | 0x07;
         }
         uint64_t *pdpt = (uint64_t *)(uintptr_t)(pml4[pml4_idx] & ~0xFFF);
         if (!(pdpt[pdpt_idx] & 1)) {
-            uint64_t *pd = mmap_user(0, 4096, 3, 0);
+            uint64_t *pd = page_frame_kernel();
             if (!pd) return -1;
             for (int i = 0; i < 512; i++) pd[i] = 0;
             pdpt[pdpt_idx] = (uint64_t)(uintptr_t)pd | 0x07;
+            if (pdpt_idx == 3) {
+                extern void watch_add(uint64_t pa);
+                watch_add((uint64_t)(uintptr_t)pd);
+                extern void serial_puts(const char *s);
+                extern void serial_puthex(uint32_t v);
+                serial_puts("[map-phys] pdpt3 va="); serial_puthex((uint32_t)va);
+                serial_puts(" pd="); serial_puthex((uint32_t)(uint64_t)pd);
+                serial_puts("\r\n");
+            }
         }
         uint64_t *pd = (uint64_t *)(uintptr_t)(pdpt[pdpt_idx] & ~0xFFF);
         pd[pd_idx] = pa | entry_flags;
@@ -683,7 +1165,7 @@ static uint64_t user_va_next = USER_VA_BASE;
 /* ~ simples mas essencial, n mexe sem saber oq ta fazendo */
 static int ensure_pml4_entry(uint64_t *pml4, int idx) {
     if (pml4[idx] & 1) return 0;
-    uint64_t *page = mmap_user(0, 4096, 3, 0);
+    uint64_t *page = page_frame_kernel();
     if (!page) return -1;
     for (int i = 0; i < 512; i++) page[i] = 0;
     pml4[idx] = (uint64_t)(uintptr_t)page | 0x07;
@@ -700,20 +1182,20 @@ static int map_one_page(uint64_t va, uint64_t pa, uint64_t cr3) {
     if (ensure_pml4_entry(pml4, pml4_idx) < 0) return -1;
     uint64_t *pdpt = (uint64_t *)(uintptr_t)(pml4[pml4_idx] & ~0xFFFULL);
     if (!(pdpt[pdpt_idx] & 1)) {
-        uint64_t *pd = mmap_user(0, 4096, 3, 0);
+        uint64_t *pd = page_frame_kernel();
         if (!pd) return -1;
         for (int i = 0; i < 512; i++) pd[i] = 0;
         pdpt[pdpt_idx] = (uint64_t)(uintptr_t)pd | 0x07;
     }
     uint64_t *pd = (uint64_t *)(uintptr_t)(pdpt[pdpt_idx] & ~0xFFFULL);
     if (!(pd[pd_idx] & 1)) {
-        uint64_t *pt = mmap_user(0, 4096, 3, 0);
+        uint64_t *pt = page_frame_kernel();
         if (!pt) return -1;
         for (int i = 0; i < 512; i++) pt[i] = 0;
         pd[pd_idx] = (uint64_t)(uintptr_t)pt | 0x07;
     } else if (pd[pd_idx] & 0x80) {
         uint64_t pde = pd[pd_idx];
-        uint64_t *pt = mmap_user(0, 4096, 3, 0);
+        uint64_t *pt = page_frame_kernel();
         if (!pt) return -1;
         uint64_t phys_base = pde & ~0x1FFFFFULL;
         uint64_t flags = pde & 0x1FF;

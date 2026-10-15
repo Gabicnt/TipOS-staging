@@ -126,13 +126,16 @@ int process_create_user(const char *name, void *entry, void *user_stack, uint64_
     pcb->pid = next_pid++;
     pcb->state = PROC_READY;
     pcb->is_user = 1;
+    pcb->in_kern = 0;
+    pcb->user_rsp = (uint64_t)user_stack + user_stack_size;
     for (int i = 0; name[i] && i < PROC_NAME_MAX - 1; i++) pcb->name[i] = name[i];
 
     uint64_t *ksp = (uint64_t *)((uint8_t *)kstack + STACK_SIZE);
     pcb->kernel_rsp = (uint64_t)ksp;
     pcb->rsp0 = (uint64_t)ksp;
     pcb->pml4 = pml4_get_current();
-    pcb->parent_pid = current_pid;
+    pcb_t *parent = process_current();
+    pcb->parent_pid = parent ? parent->pid : 0;
     pcb->exit_code = 0;
     pcb->program_break = 0x201000;
     pcb->heap_start = 0x201000;
@@ -141,6 +144,10 @@ int process_create_user(const char *name, void *entry, void *user_stack, uint64_
     pcb->fs_base = 0;
     pcb->th_parent_pid = -1;
     pcb->clear_tid = 0;
+    pcb->pgrp = pcb->pid;
+    pcb->session = current_pid >= 0 && current_pid < MAX_PROC &&
+                   pcb_table[current_pid].state != PROC_EMPTY
+        ? pcb_table[current_pid].session : pcb->pid;
 
     pcb->cwd[0] = '/'; pcb->cwd[1] = '\0';
     setup_user_stack(pcb, entry, user_stack, user_stack_size);
@@ -166,22 +173,40 @@ int proc_spawn(const char *name, void *entry, void *user_stack_top) {
     p->pid = next_pid++;
     p->state = PROC_READY;
     p->is_user = 1;
+    p->in_kern = 0;
 
     int ni = 0;
     while (name[ni] && ni < PROC_NAME_MAX - 1) { p->name[ni] = name[ni]; ni++; }
     p->name[ni] = '\0';
 
     p->rsp0 = (uint64_t)kstack + STACK_SIZE;
+    p->user_rsp = (uint64_t)user_stack_top;
     p->pml4 = my_pml4;
-    p->parent_pid = current_pid;
+    pcb_t *parent = process_current();
+    p->parent_pid = parent ? parent->pid : 0;
     p->exit_code = 0;
     p->program_break = 0x201000;
     p->heap_start = 0x201000;
     p->vm_map = (struct vm_map *)kmalloc(sizeof(struct vm_map));
     if (p->vm_map) vm_map_init((vm_map_t *)p->vm_map, 0x10000, 0x7FFFF000ULL);
-    p->fs_base = 0;
+    p->fs_base = 0x50000000ULL + ((uint64_t)p->pid * 0x1000ULL);
+    if (map_user_4kb(p->pml4, p->fs_base) < 0) p->fs_base = 0x1000ULL;
+    volatile uint64_t *tls_page = (volatile uint64_t *)(uintptr_t)p->fs_base;
+    tls_page[0] = 0; tls_page[1] = 0; tls_page[2] = 0; tls_page[3] = 0;
     p->th_parent_pid = -1;
     p->clear_tid = 0;
+    p->pgrp = p->pid;
+    p->session = current_pid >= 0 && current_pid < MAX_PROC &&
+                 pcb_table[current_pid].state != PROC_EMPTY
+        ? pcb_table[current_pid].session : p->pid;
+    p->blocked = 0;
+    p->pending = 0;
+    for (int signal_index = 0; signal_index < 64; signal_index++) {
+        p->actions[signal_index].handler = 0;
+        p->actions[signal_index].flags = 0;
+        p->actions[signal_index].restorer = 0;
+        p->actions[signal_index].mask = 0;
+    }
     p->cwd[0] = '/'; p->cwd[1] = '\0';
 
     // proc_spawn nao usa alloc_pcb(), entao precisamos
@@ -220,15 +245,18 @@ void process_switch_to(int pid) {
     if (!current) { serial_puts("[PROC] no current!\r\n"); return; }
 
     pcb_t *next = 0;
+    int next_idx = -1;
     for (int i = 0; i < MAX_PROC; i++) {
         if (pcb_table[i].state != PROC_EMPTY && pcb_table[i].pid == pid) {
-            next = &pcb_table[i]; break;
+            next = &pcb_table[i];
+            next_idx = i;
+            break;
         }
     }
     if (!next) { serial_puts("[PROC] no next!\r\n"); return; }
 
     pcb_table[current_pid].state = PROC_BLOCKED;
-    current_pid = pid;
+    current_pid = next_idx;
     next->state = PROC_RUNNING;
     tss_set_rsp0(next->rsp0);
 
@@ -257,32 +285,69 @@ void process_switch_to(int pid) {
 /* ♥ process_exit_current ~ API antiga, usada pela syscall SYS_exit */
 /* ~ kyun~ mais uma funcao pra fazer o kernel n morrer */
 void process_exit_current(int code) {
+    pcb_t *p = process_current();
+    if (!p) return;
     serial_puts("[PROC] exit pid=");
-    serial_puthex((uint32_t)current_pid);
+    serial_puthex((uint32_t)p->pid);
     serial_puts(" code=");
     serial_puthex((uint32_t)code);
     serial_puts("\r\n");
-    pcb_t *p = process_current();
-    if (!p) return;
     {
         extern void fds_close_exec(void *);
         fds_close_exec(p->fds_tab);
     }
+    /* FASE5: devolve os mapeamentos com objeto (file/wire/SHM) ao buddy.
+     * Antes o espaço inteiro vazava no exit (pml4_destroy só solta o
+     * topo): com o fontconfig mapeando 100s de MB, o pool esgotava
+     * ("ba: no free" no mmap do foot). Só objetos (páginas
+     * order-0 exatas); tabelas/PTEs e o resto vazam como antes (o
+     * processo nunca mais roda; a troca de CR3 descarrega a TLB).
+     * Threads (vm_map compartilhado) NÃO passam por aqui. */
+    if (p->th_parent_pid < 0 && p->vm_map) {
+        vm_map_remove(p->vm_map, 0, (uint64_t)~0ULL);
+    }
+    /* FASE5: morte fatal mata o grupo (irmãs p/ EMPTY com clear_tid
+     * zerado); sem isso a thread órfã voltava ao scheduler com a
+     * memória do main liberada (#GP no switch). */
+    proc_kill_siblings(p);
     p->exit_code = code;
     p->state = PROC_ZOMBIE;
+    signal_send_pid(p->parent_pid, TIPOS_SIGCHLD);
 
     proc_wake_parent(p->pid);
 
     /* Volta pro pai */
-    int parent = p->parent_pid;
-    if (parent < 0 || parent >= MAX_PROC) parent = 0;
-    if (pcb_table[parent].state == PROC_BLOCKED || pcb_table[parent].state == PROC_READY)
-        pcb_table[parent].state = PROC_READY;
-    current_pid = parent;
-    pcb_t *next = &pcb_table[parent];
+    int parent_pid = p->parent_pid;
+    int parent_slot = 0;
+    for (int slot = 0; slot < MAX_PROC; slot++) {
+        if (pcb_table[slot].state != PROC_EMPTY && pcb_table[slot].pid == parent_pid) {
+            parent_slot = slot;
+            break;
+        }
+    }
+    if (pcb_table[parent_slot].state == PROC_BLOCKED ||
+        pcb_table[parent_slot].state == PROC_READY)
+        pcb_table[parent_slot].state = PROC_READY;
+    /* ~~ pai já morreu (ZOMBIE/EMPTY): NÃO dá resume nele — o
+     * context_switch faria pops+iretq num frame salvo que já é lixo
+     * (o KRNL_RSP do próprio exit aponta pra pilha C do exit) →
+     * CS=lixo → #GP em ring 0 e o QEMU morre. Deixa o scheduler
+     * escolher outro processo pronto. ~~ */
+    {
+        int ps = pcb_table[parent_slot].state;
+        if (ps == PROC_ZOMBIE || ps == PROC_EMPTY) {
+            serial_puts("[exit] pai morto slot=");
+            serial_puthex((uint32_t)parent_slot);
+            serial_puts(" -> schedule\r\n");
+            schedule();
+            for (;;) __asm__ volatile("cli; hlt");
+        }
+    }
+    current_pid = parent_slot;
+    pcb_t *next = &pcb_table[parent_slot];
     tss_set_rsp0(next->rsp0);
     serial_puts("[exit] parent=");
-    serial_puthex((uint32_t)parent);
+    serial_puthex((uint32_t)parent_pid);
     serial_puts(" in_kern=");
     serial_puthex((uint32_t)next->in_kern);
     serial_puts("\r\n");
@@ -297,6 +362,7 @@ void proc_exit(int code) {
     pcb_t *p = &pcb_table[current_pid];
     p->exit_code = code;
     p->state = PROC_ZOMBIE;
+    signal_send_pid(p->parent_pid, TIPOS_SIGCHLD);
     proc_wake_parent(p->pid);
     schedule();
     for (;;) __asm__ volatile("hlt");
@@ -348,16 +414,17 @@ int proc_waitpid(int pid, int *exit_code) {
 
 /* ~ simples mas essencial, n mexe sem saber oq ta fazendo */
 pcb_t *process_current(void) {
-    for (int i = 0; i < MAX_PROC; i++)
-        if (pcb_table[i].state != PROC_EMPTY && pcb_table[i].pid == current_pid)
-            return &pcb_table[i];
-    return 0;
+    if (current_pid < 0 || current_pid >= MAX_PROC ||
+        pcb_table[current_pid].state == PROC_EMPTY)
+        return 0;
+    return &pcb_table[current_pid];
 }
 
 /* ~~ Processando~~ ufaaa que trabalhão! */
 /* ~ essa funcao aqui e a mais importante, presta atencao baka! */
 int process_current_pid(void) {
-    return current_pid;
+    pcb_t *current = process_current();
+    return current ? current->pid : -1;
 }
 
 /* ~ cuidado que essa aqui morde ~ */
@@ -392,7 +459,16 @@ void schedule(void) {
             serial_puts("\r\n");
         }
     }
-    if (next_idx == -1 || next_idx == current_pid) return;
+    if (next_idx == -1 || next_idx == current_pid) {
+        /* FASE6-stalemate: nada p/ trocar => abre IRQs e dorme um tick.
+         * Sem isso, com IF=0 em syscall + todos bloqueados, ninguém
+         * volta a userspace, IRQs pendentes nunca atendidas (timer
+         * morto, mouse morto) = impasse eterno. sti+hlt: seguro aqui
+         * (schedule nunca roda dentro de handler IRQ; handlers não
+         * pegam locks de syscall; IRQ pendente entre sti/hlt acorda). */
+        __asm__ volatile("sti; hlt");
+        return;
+    }
     int prev = current_pid;
 
     if (pcb_table[prev].in_kern) {
@@ -418,33 +494,35 @@ void schedule(void) {
         extern volatile int g_in_syscall;
         extern void context_switch_kern(pcb_t *cur, pcb_t *next);
         if (g_in_syscall && pcb_table[prev].is_user) {
-            uint64_t *nf = (uint64_t *)pcb_table[next_idx].kernel_rsp;
-            serial_puts("[nkf] slot=");
-            serial_puthex((uint32_t)next_idx);
-            serial_puts(" ik=");
-            serial_puthex((uint32_t)pcb_table[next_idx].in_kern);
-            serial_puts(" cr3next=");
-            serial_puthex((uint32_t)(pcb_table[next_idx].pml4 & 0xFFFFFFFF));
-            serial_puts(" cr3cur=");
-            serial_puthex((uint32_t)(pcb_table[prev].pml4 & 0xFFFFFFFF));
-            serial_puts(" rax=");
-            serial_puthex((uint32_t)nf[14]);
-            serial_puts("\r\n");
             context_switch_kern(&pcb_table[prev], &pcb_table[next_idx]);
+            /* ~~ fd table POR PROCESSO: religa ao voltar de uma troca ~~
+             * `fdtab` (macro `fds`) e global: enquanto o processo A
+             * dormia numa syscall bloqueante, o processo B rodava e
+             * rebindava a tabela pra ELE. Ao acordar, A continuava
+             * lendo os fds de B — o poll do fvwm2 via POLLERR no
+             * socket X (fds do Xorg) e o Xlib derrubava a conexão.
+             * Refaz o bind antes de voltar pro meio da syscall. ~~ */
+            {
+                extern void fds_bind_current(void);
+                fds_bind_current();
+            }
             return;
         }
     }
     {
         /* ~~ debug: frame do proximo processo antes do switch ~~ */
         static int dbg_cs = 0;
-        if (dbg_cs < 4 && pcb_table[next_idx].pid >= 3) {
+        if (dbg_cs < 12 && pcb_table[next_idx].pid >= 3) {
             dbg_cs++;
-            uint64_t *fr = (uint64_t *)pcb_table[next_idx].kernel_rsp;
-            serial_puts("[cs] krsp=");
+            serial_puts("[cs] idx="); serial_puthex((uint32_t)next_idx);
+            serial_puts(" pid="); serial_puthex((uint32_t)pcb_table[next_idx].pid);
+            serial_puts(" st="); serial_puthex((uint32_t)pcb_table[next_idx].state);
+            serial_puts(" krsp=");
             serial_puthex((uint32_t)pcb_table[next_idx].kernel_rsp);
             serial_puts(" pml4=");
             serial_puthex((uint32_t)pcb_table[next_idx].pml4);
             serial_puts("\r\n[fr] rip=");
+            uint64_t *fr = (uint64_t *)pcb_table[next_idx].kernel_rsp;
             serial_puthex((uint32_t)fr[15]);
             serial_puts(" cs=");
             serial_puthex((uint32_t)fr[16]);
@@ -454,6 +532,11 @@ void schedule(void) {
         }
     }
     context_switch(&pcb_table[prev], &pcb_table[next_idx]);
+    /* ~~ mesma religação do fd table no caminho não-syscall ~~ */
+    {
+        extern void fds_bind_current(void);
+        fds_bind_current();
+    }
 }
 
 /* ~~ setup_linux_user_stack_dyn ~ wrapper pro ELF dinâmico (#71) ~~
@@ -465,11 +548,11 @@ uint64_t setup_linux_user_stack_dyn(pcb_t *pcb, uint64_t user_stack_top,
                                     char **envp, int envc,
                                     uint64_t interp_base, uint64_t main_entry,
                                     int is_dynamic) {
-    (void)main_entry;
     uint64_t at_base = is_dynamic ? interp_base : elf_base;
     return setup_linux_user_stack(pcb, user_stack_top,
                                   phdr, phent, phnum,
-                                  at_base, argv, argc, envp, envc);
+                                  at_base, argv, argc, envp, envc,
+                                  main_entry);
 }
 
 /* ♥ proc_yield ~ "Me da a vez, CPU! >_<" */
@@ -495,7 +578,8 @@ uint64_t setup_linux_user_stack(pcb_t *pcb, uint64_t user_stack_top,
                                 uint64_t phdr, uint64_t phent, uint64_t phnum,
                                 uint64_t elf_base,
                                 char **argv, int argc,
-                                char **envp, int envc) {
+                                char **envp, int envc,
+                                uint64_t at_entry) {
     uint64_t *sp = (uint64_t *)user_stack_top;
     (void)pcb;
 
@@ -507,6 +591,24 @@ uint64_t setup_linux_user_stack(pcb_t *pcb, uint64_t user_stack_top,
     serial_puts(" n=");
     serial_puthex(dbg_setup_count);
     serial_puts("\r\n");
+    if (argv && argc > 0 && argv[0] && argv[0][0] == '/' &&
+        argv[0][1] == 'B' && argv[0][2] == 'I' && argv[0][3] == 'N' &&
+        argv[0][4] == '/' && argv[0][5] == 'X' && argv[0][6] == 'T' &&
+        argv[0][7] == 'E' && argv[0][8] == 'R' && argv[0][9] == 'M' &&
+        argv[0][10] == '\0') {
+        for (int index = 0; index < argc && index < 8; index++) {
+            serial_puts("[ARGV] ");
+            serial_puthex((uint32_t)index);
+            serial_puts("='");
+            serial_puts(argv[index] ? argv[index] : "(null)");
+            serial_puts("'\r\n");
+        }
+        for (int index = 0; index < envc && index < 8; index++) {
+            serial_puts("[ENV] '");
+            serial_puts(envp && envp[index] ? envp[index] : "(null)");
+            serial_puts("'\r\n");
+        }
+    }
 
     /* ~~ Strings dos argumentos ficam no TOPO da pilha ~~
      * Layout Linux x86_64 (de baixo pra cima):
@@ -516,7 +618,7 @@ uint64_t setup_linux_user_stack(pcb_t *pcb, uint64_t user_stack_top,
      * entry do environ! getenv("PIXMAN_DISABLE") do pixman
      * lia "XORG\0XOR" como ponteiro (não-canônico) e o XORG
      * tomava #GP no strncmp~ rssrsrs */
-    uint64_t str_ptrs[8];
+    uint64_t str_ptrs[16];
     for (int i = argc - 1; i >= 0; i--) {
         const char *s = (argv && argv[i]) ? argv[i] : "";
         size_t len = 0;
@@ -528,7 +630,7 @@ uint64_t setup_linux_user_stack(pcb_t *pcb, uint64_t user_stack_top,
 
     /* ~~ Strings do ambiente (mesma danca do argv) ~~
      * O FVWM precisa do DISPLAY=:0 pra achar o servidor!~ */
-    uint64_t env_ptrs[8];
+    uint64_t env_ptrs[16];
     for (int i = envc - 1; i >= 0; i--) {
         const char *s = (envp && envp[i]) ? envp[i] : "";
         size_t len = 0;
@@ -537,6 +639,19 @@ uint64_t setup_linux_user_stack(pcb_t *pcb, uint64_t user_stack_top,
         for (size_t j = 0; j <= len; j++) ((uint8_t *)sp)[j] = (uint8_t)s[j];
         env_ptrs[i] = (uint64_t)sp;
     }
+
+    const uint64_t argv_words = (argc > 0 && argv) ? (uint64_t)argc + 2 : 2;
+    const uint64_t env_words = (envc > 0) ? (uint64_t)envc + 1 : 1;
+    const uint64_t aux_words = (phnum ? 16 : 10) + (at_entry ? 2 : 0) +
+                               ((argc > 0 && argv) ? 2 : 0) + 12;
+    const uint64_t stack_words = 2 + aux_words + env_words + argv_words;
+    const uint64_t sp_addr = (uint64_t)sp;
+    /* ~~ ABI SysV: RSP inicial do processo DEVE ser 16-byte aligned ~~
+     * O '-8' antigo deixava rsp ≡ 8 (mod 16); o ld.so do glibc acha
+     * movaps %xmm, -0x80(%rbp) com rbp desalinhado → #GP err=0 no
+     * _dl_start. Sem o -8 o rsp final fica ≡ 0 (mod 16)~ */
+    const uint64_t align_pad = (sp_addr - stack_words * sizeof(uint64_t)) & 0xF;
+    sp = (uint64_t *)(uintptr_t)(sp_addr - align_pad);
 
     /* ~~ 16 bytes pseudo-aleatórios pro AT_RANDOM ~~
      * O kernel Linux de verdade pega do /dev/random~
@@ -555,6 +670,10 @@ uint64_t setup_linux_user_stack(pcb_t *pcb, uint64_t user_stack_top,
      * sem AT_BASE (ou com ele no lugar errado) ele reloca em 0~
      * e o mundo desaba. Confia na ordem! kyun! */
     *--sp = 0;  *--sp = 0;             /* AT_NULL — topo da pilha de pares */
+    if (at_entry) {
+        *--sp = at_entry; *--sp = 9;   /* AT_ENTRY — entry do binário principal
+                                        * (o ld.so do glibc pula pra cá no fim)*/
+    }
     if (phnum) {
         *--sp = phdr;  *--sp = 3;     /* AT_PHDR — onde tao os headers~ */
         *--sp = phent; *--sp = 4;     /* AT_PHENT — tamanho de cada um~ */
@@ -563,13 +682,24 @@ uint64_t setup_linux_user_stack(pcb_t *pcb, uint64_t user_stack_top,
     *--sp = 0;      *--sp = 23;        /* AT_SECURE — "to suave, sem seccomp" */
     *--sp = 0x1000; *--sp = 6;         /* AT_PAGESZ — 4KB, padrao~ */
     *--sp = elf_base; *--sp = 7;       /* AT_BASE — base do PIE pro self-reloc~ */
-    *--sp = random_addr; *--sp = 15;   /* AT_RANDOM — "sorteia um numero ai!" */
+    *--sp = random_addr; *--sp = 25;   /* AT_RANDOM */
+    *--sp = 0xbfebfbffULL; *--sp = 16;  /* AT_HWCAP — x86_64 feature bits (glibc checa) */
+    *--sp = 100; *--sp = 17;            /* AT_CLKTCK — 100 Hz (sysconf SC_CLK_TCK) */
+    *--sp = 0; *--sp = 11;              /* AT_UID */
+    *--sp = 0; *--sp = 12;              /* AT_EUID */
+    *--sp = 0; *--sp = 13;              /* AT_GID */
+    *--sp = 0; *--sp = 14;              /* AT_EGID */
+    if (argc > 0 && argv) {
+        *--sp = str_ptrs[0]; *--sp = 31; /* AT_EXECFN */
+    }
 
     /* ~~ Ambiente: ponteiros + NULL terminador ~~
-     * AGORA com variaveis de verdade! O musl procura o environ
-     * logo apos o argv — e o FVWM le o DISPLAY daqui~ kyun~ */
+     * ORDEM CRÍTICA: o NULL tem que ser escrito PRIMEIRO (fica no
+     * endereço MAIOR) pra subir na memória como [env0..envN,NULL].
+     * Com o NULL depois do loop ele ficava em [NULL,env0..] e o glibc
+     * parava o envp na hora e lixa o auxv (AT_RANDOM=0 → #PF em 0)~ */
+    *--sp = 0;  /* NULL termina o envp[] */
     for (int i = envc - 1; i >= 0; i--) *--sp = env_ptrs[i];
-    *--sp = 0;
 
     /* ~~ Argumentos: o array de ponteiros + argc ~~ */
     if (argc > 0 && argv) {
@@ -579,6 +709,37 @@ uint64_t setup_linux_user_stack(pcb_t *pcb, uint64_t user_stack_top,
     } else {
         *--sp = 0;  /* argv: lista vazia */
         *--sp = 0;  /* argc = 0 */
+    }
+
+    uint64_t *auxv = sp + argv_words + env_words;
+    for (int i = 0; i < 12; i++) {
+        uint64_t type = auxv[i * 2];
+        uint64_t value = auxv[i * 2 + 1];
+        serial_puts("[AUXV] ");
+        serial_puthex((uint32_t)type);
+        serial_puts("=");
+        serial_puthex((uint32_t)value);
+        if (type == 31) {
+            serial_puts(" ");
+            serial_puts((const char *)(uintptr_t)value);
+        }
+        serial_puts("\r\n");
+        if (type == 0) break;
+    }
+
+    if (argv && argc == 3 && argv[0] && argv[0][0] == '/' &&
+        argv[0][1] == 'B' && argv[0][2] == 'I' && argv[0][3] == 'N' &&
+        argv[0][4] == '/' && argv[0][5] == 'X' && argv[0][6] == 'T' &&
+        argv[0][7] == 'E' && argv[0][8] == 'R' && argv[0][9] == 'M' &&
+        argv[0][10] == '\0') {
+        uint64_t *initial = sp;
+        serial_puts("[USTACK] argc="); serial_puthex((uint32_t)initial[0]);
+        serial_puts(" argv0='"); serial_puts((const char *)(uintptr_t)initial[1]);
+        serial_puts("' argv1='"); serial_puts((const char *)(uintptr_t)initial[2]);
+        serial_puts("' argv2='"); serial_puts((const char *)(uintptr_t)initial[3]);
+        serial_puts("' env0='");
+        serial_puts((const char *)(uintptr_t)initial[5]);
+        serial_puts("'\r\n");
     }
 
     return (uint64_t)sp;
@@ -596,20 +757,80 @@ extern int map_user_4kb(uint64_t pml4_pa, uint64_t vaddr);
  * aloca frame — e o readback leria o frame como se fosse PT (lixo,
  * write em non-canonical → #GP na cara~ rssrsrs aprendi na prática!) */
 extern int split_2mb_pde(uint64_t pml4_pa, uint64_t vaddr);
-static uint64_t child_frame_for(uint64_t child_pml4, uint64_t va) {
-    split_2mb_pde(child_pml4, va & ~0x1FFFFFULL);
-    if (map_user_4kb(child_pml4, va) < 0) return 0;
-    uint64_t *pml4 = (uint64_t *)(uintptr_t)child_pml4;
-    uint64_t *pdpt = (uint64_t *)(uintptr_t)(pml4[(va >> 39) & 0x1FF] & ~0xFFFULL);
-    uint64_t *pd   = (uint64_t *)(uintptr_t)(pdpt[(va >> 30) & 0x1FF] & ~0xFFFULL);
-    uint64_t *pt   = (uint64_t *)(uintptr_t)(pd[(va >> 21) & 0x1FF] & ~0xFFFULL);
-    uint64_t pte   = pt[(va >> 12) & 0x1FF];
-    if (!(pte & 1)) return 0;
-    return pte & 0x000FFFFFFFFFF000ULL;   /* só bits 51:12 (NX/avail fora!) */
+
+/* ~~ tabela ainda compartilhada com o pai? Copia ela pro filho ~~
+ * pml4_create() copia só as ENTRADAS do pml4 — os níveis de baixo
+ * (PDPT/PD/PT) eram os MESMOS frames pros dois processos. O
+ * map_user_4kb via o PTE já existente e devolvia o frame DO PAI:
+ * o "fork" ficava com memória compartilhada e o filho destroçava o
+ * stack do pai (sintoma no fvwm2: *** stack smashing detected ***
+ * logo depois do fork do Exec). ~~ */
+static uint64_t tbl_clone_if_shared(uint64_t *child_slot,
+                                    uint64_t child_tbl,
+                                    uint64_t parent_tbl) {
+    if (!child_tbl) return 0;
+    if (child_tbl != parent_tbl) return child_tbl;   /* já é privada */
+    uint64_t *np = page_frame_kernel();
+    if (!np) return 0;
+    uint64_t *src = (uint64_t *)(uintptr_t)parent_tbl;
+    for (int i = 0; i < 512; i++) np[i] = src[i];
+    uint64_t newpa = (uint64_t)(uintptr_t)np;
+    *child_slot = (*child_slot & 0xFFFULL) | newpa;
+    return newpa;
 }
 
-/* copia página user: fonte lida pelo VA direto (CR3 é o pai na syscall)~ */
-static void copy_user_space(uint64_t src_pml4_pa, uint64_t dst_pml4_pa) {
+/* devolve um frame NOVO (só do filho) pro VA, com a cópia das tabelas
+ * em cima. O caller copia os bytes do frame do pai pra cá. */
+static uint64_t child_frame_for(uint64_t child_pml4, uint64_t src_pml4,
+                                uint64_t va) {
+    int i4 = (va >> 39) & 0x1FF;
+    int i3 = (va >> 30) & 0x1FF;
+    int i2 = (va >> 21) & 0x1FF;
+    int i1 = (va >> 12) & 0x1FF;
+    uint64_t *p4c = (uint64_t *)(uintptr_t)child_pml4;
+    uint64_t *p4s = (uint64_t *)(uintptr_t)src_pml4;
+    if (!(p4c[i4] & 1) || !(p4s[i4] & 1)) return 0;
+
+    /* divide 2MB nos DOIS lados (neutro pro pai: mesmo PA + flags) pra
+     * as comparações de frame abaixo serem de tabela de verdade */
+    split_2mb_pde(child_pml4, va);
+    split_2mb_pde(src_pml4, va);
+
+    uint64_t pdpt = tbl_clone_if_shared(&p4c[i4], p4c[i4] & ~0xFFFULL,
+                                        p4s[i4] & ~0xFFFULL);
+    if (!pdpt) return 0;
+    uint64_t *p3c = (uint64_t *)(uintptr_t)pdpt;
+    uint64_t *p3s = (uint64_t *)(uintptr_t)(p4s[i4] & ~0xFFFULL);
+    if (!(p3c[i3] & 1) || !(p3s[i3] & 1)) return 0;
+    if (p3c[i3] & 0x80) return 0;      /* 1GB huge: não mexe */
+
+    uint64_t pd = tbl_clone_if_shared(&p3c[i3], p3c[i3] & ~0xFFFULL,
+                                      p3s[i3] & ~0xFFFULL);
+    if (!pd) return 0;
+    uint64_t *p2c = (uint64_t *)(uintptr_t)pd;
+    uint64_t *p2s = (uint64_t *)(uintptr_t)(p3s[i3] & ~0xFFFULL);
+    if (!(p2c[i2] & 1) || !(p2s[i2] & 1)) return 0;
+    if (p2c[i2] & 0x80) return 0;      /* ainda huge: skip */
+
+    uint64_t pt = tbl_clone_if_shared(&p2c[i2], p2c[i2] & ~0xFFFULL,
+                                      p2s[i2] & ~0xFFFULL);
+    if (!pt) return 0;
+    uint64_t *ptc = (uint64_t *)(uintptr_t)pt;
+
+    uint64_t *frame = mmap_user(0, 4096, 3, 0);
+    if (!frame) return 0;
+    uint64_t flags = (ptc[i1] & 1) ? (ptc[i1] & 0xFFF) : 0x07;
+    ptc[i1] = ((uint64_t)(uintptr_t)frame & ~0xFFFULL) | flags;
+    __asm__ volatile("invlpg (%0)" : : "r"(va) : "memory");
+    return (uint64_t)(uintptr_t)frame;
+}
+
+/* copia página user: fonte lida pelo VA direto (CR3 é o pai na syscall)~
+ * skip_lo/skip_hi: faixa de kstack do FILHO — é memória de kernel, o
+ * filho tem a dele própria; copiar ia trocar o frame onde o kernel
+ * vai montar o iretq-frame do filho (GPF na retomada). */
+static void copy_user_space(uint64_t src_pml4_pa, uint64_t dst_pml4_pa,
+                            uint64_t skip_lo, uint64_t skip_hi) {
     uint64_t *sp4 = (uint64_t *)(uintptr_t)src_pml4_pa;
     for (int i = 0; i < 512; i++) {
         uint64_t e4 = sp4[i];
@@ -626,9 +847,17 @@ static void copy_user_space(uint64_t src_pml4_pa, uint64_t dst_pml4_pa) {
                 uint64_t base = ((uint64_t)i << 39) | ((uint64_t)j << 30) | ((uint64_t)k << 21);
                 if (e2 & 0x80) {
                     uint64_t pa2 = e2 & 0x000FFFFFE00000ULL;   /* bits 51:21 */
+                    /* ~~ NÃO copia MMIO (≥2GB): RAM toda é <512MB aqui,
+                     *  então qualquer pa alto é BAR de dispositivo (GPU,
+                     *  e1000…). Ler como linear derruba o fork com #PF
+                     *  (VA 0xFE800000 sem identity garantido)~ */
+                    if (pa2 >= 0x80000000ULL) continue;
                     for (int n = 0; n < 512; n++) {
                         uint64_t va = base + ((uint64_t)n << 12);
-                        uint64_t fr = child_frame_for(dst_pml4_pa, va);
+                        if (va >= skip_lo && va < skip_hi) continue;
+                        uint64_t src_pa = pa2 + ((uint64_t)n << 12);
+                        if (!frame_is_user(src_pa)) continue;  /* kernel: share */
+                        uint64_t fr = child_frame_for(dst_pml4_pa, src_pml4_pa, va);
                         if (!fr) {
                             serial_puts("[fork!] huge sem frame va=");
                             serial_puthex((uint32_t)(va >> 12));
@@ -637,7 +866,7 @@ static void copy_user_space(uint64_t src_pml4_pa, uint64_t dst_pml4_pa) {
                         }
                         for (int b = 0; b < 1024; b++)
                             ((uint32_t *)(uintptr_t)fr)[b] =
-                                ((uint32_t *)(uintptr_t)(pa2 + ((uint64_t)n << 12)))[b];
+                                ((uint32_t *)(uintptr_t)src_pa)[b];
                         /* ~~ debug TCB: página que contém o fs_base do forktest ~~ */
                         if (va == 0x40206000ULL) {
                             uint64_t srcv = *(uint64_t *)(uintptr_t)(pa2 + 0x818);
@@ -654,13 +883,61 @@ static void copy_user_space(uint64_t src_pml4_pa, uint64_t dst_pml4_pa) {
                         }
                     }
                 } else {
-                    uint64_t *spt = (uint64_t *)(uintptr_t)(e2 & 0x000FFFFFFFFFF000ULL);
+                    uint64_t pt_pa = e2 & 0x000FFFFFFFFFF000ULL;
+                    /* ~~ PDE aponta pra fora da RAM (>=2GB) ou é lixo:
+                     * desce numa página de dados e o loop lê entradas
+                     * não-canônicas → #GP no fork (QEMU morre). ~~ */
+                    if (pt_pa >= 0x80000000ULL) {
+                        /* dump completo do PD corrompido (1a vez) */
+                        static int dumped_pd;
+                        if (!dumped_pd) {
+                            dumped_pd = 1;
+                            int nz = 0;
+                            serial_puts("[pd-dump] pa=");
+                            serial_puthex((uint32_t)((uint64_t)sp2 >> 32));
+                            serial_puthex((uint32_t)(uint64_t)sp2);
+                            for (int d = 0; d < 512 && nz < 16; d++) {
+                                if (!sp2[d]) continue;
+                                nz++;
+                                serial_puts(" ["); serial_puthex(d);
+                                serial_puts("]=");
+                                serial_puthex((uint32_t)(sp2[d] >> 32));
+                                serial_puthex((uint32_t)sp2[d]);
+                                serial_puts("]");
+                            }
+                            serial_puts("\r\n");
+                        }
+                        serial_puts("[fork-bad] i="); serial_puthex(i);
+                        serial_puts(" j="); serial_puthex(j);
+                        serial_puts(" k="); serial_puthex(k);
+                        serial_puts(" pde=");
+                        serial_puthex((uint32_t)(e2 >> 32));
+                        serial_puthex((uint32_t)e2);
+                        serial_puts(" pd=");
+                        serial_puthex((uint32_t)((uint64_t)sp2 >> 32));
+                        serial_puthex((uint32_t)(uint64_t)sp2);
+                        serial_puts(" e3=");
+                        serial_puthex((uint32_t)(e3 >> 32));
+                        serial_puthex((uint32_t)e3);
+                        serial_puts(" pdpt=");
+                        serial_puthex((uint32_t)((uint64_t)sp3 >> 32));
+                        serial_puthex((uint32_t)(uint64_t)sp3);
+                        serial_puts(" e4=");
+                        serial_puthex((uint32_t)(e4 >> 32));
+                        serial_puthex((uint32_t)e4);
+                        serial_puts("\r\n");
+                        continue;
+                    }
+                    uint64_t *spt = (uint64_t *)(uintptr_t)pt_pa;
                     for (int n = 0; n < 512; n++) {
                         uint64_t e1 = spt[n];
                         if (!(e1 & 1) || !(e1 & 4)) continue;
                         uint64_t va = base + ((uint64_t)n << 12);
                         uint64_t pa1 = e1 & 0x000FFFFFFFFFF000ULL;
-                        uint64_t fr = child_frame_for(dst_pml4_pa, va);
+                        if (pa1 >= 0x80000000ULL) continue;   /* MMIO: não copia */
+                        if (va >= skip_lo && va < skip_hi) continue;
+                        if (!frame_is_user(pa1)) continue;   /* kernel: share */
+                        uint64_t fr = child_frame_for(dst_pml4_pa, src_pml4_pa, va);
                         if (!fr) {
                             serial_puts("[fork!] leaf sem frame va=");
                             serial_puthex((uint32_t)(va >> 12));
@@ -707,14 +984,25 @@ int proc_fork(uint64_t *parent_kframe) {
     p->pid = next_pid++;
     p->state = PROC_READY;
     p->is_user = 1;
+    p->in_kern = 0;
     {
         int ni = 0;
         while (par->name[ni] && ni < PROC_NAME_MAX - 5) { p->name[ni] = par->name[ni]; ni++; }
         p->name[ni] = 'f'; p->name[ni+1] = 'k'; p->name[ni+2] = '\0';
     }
     p->rsp0 = (uint64_t)kstack + STACK_SIZE;
+    {
+        extern void serial_puts(const char *s);
+        extern void serial_puthex(uint32_t v);
+        serial_puts("[fork] kstack="); serial_puthex((uint32_t)kstack);
+        serial_puts(" rsp0="); serial_puthex((uint32_t)p->rsp0);
+        serial_puts("\r\n");
+    }
     p->pml4 = child_pml4;
     p->parent_pid = par->pid;
+    p->th_parent_pid = -1;   /* fork gera PROCESSO, nunca thread (FASE5: lixo
+                              * do slot reaproveitado desviava o exit do filho
+                              * pra proc_thread_exit e o waitpid nunca colhia) */
     p->exit_code = 0;
     p->program_break = par->program_break;
     p->heap_start = par->heap_start;
@@ -727,11 +1015,32 @@ int proc_fork(uint64_t *parent_kframe) {
     p->vmspace = 0;
     p->fs_base = par->fs_base;
     for (int ci = 0; ci < 256; ci++) p->cwd[ci] = par->cwd[ci];
+    for (int signal_index = 0; signal_index < 64; signal_index++)
+        p->actions[signal_index] = par->actions[signal_index];
+    p->blocked = par->blocked;
+    p->pending = 0;
+    p->pgrp = par->pgrp;
+    p->session = par->session;
+    p->controlling_tty = par->controlling_tty;
 
     if (slot >= pcb_count) pcb_count = slot + 1;
 
-    serial_puts("[fork] copiando memoria...\r\n");
-    copy_user_space(par->pml4, child_pml4);
+    serial_puts("[fork] copiando memoria par=");
+    serial_puthex(par->pid);
+    {
+        extern void serial_puthex(uint32_t v);
+        serial_puts(" rip=");
+        serial_puthex((uint32_t)(parent_kframe[17] >> 32));
+        serial_puthex((uint32_t)parent_kframe[17]);
+        serial_puts(" rsp=");
+        serial_puthex((uint32_t)(parent_kframe[20] >> 32));
+        serial_puthex((uint32_t)parent_kframe[20]);
+        serial_puts(" rflags=");
+        serial_puthex((uint32_t)parent_kframe[19]);
+    }
+    serial_puts("\r\n");
+    copy_user_space(par->pml4, child_pml4, (uint64_t)kstack,
+                    (uint64_t)kstack + STACK_SIZE);
     serial_puts("[fork] memoria ok\r\n");
 
     /* ~~ fd table própria pro filho — do POOL estático, no slot dele~~
@@ -766,7 +1075,15 @@ int proc_fork(uint64_t *parent_kframe) {
     }
     uint64_t *sp = (uint64_t *)p->rsp0;
     sp -= 20;
-    for (int q = 0; q < 15; q++) sp[q] = parent_kframe[q];  /* r15..rax */
+    /* ~~ Converte layout de syscall (parent_kframe: rax..r15) para o
+     * layout esperado pelo context_switch (sp: r15..rax) ~~
+     * parent_kframe vem de syscall_entry.asm que empilhou r15..rax
+     * (regs[0]=rax, regs[14]=r15).
+     * context_switch desempilha r15..rax (sp[0]=r15, sp[14]=rax).
+     * Sem inverter, sp[4] (RBP) recebia regs[4] (RDI = clone flags),
+     * corrompendo os registradores callee-saved da libc e disparando
+     * *** stack smashing detected *** no retorno do fork! */
+    for (int q = 0; q < 15; q++) sp[q] = parent_kframe[14 - q];
     sp[14] = 0;                     /* RAX = 0 → fork() retorna 0 no filho! */
     /* ~~ return RIP/RFLAGS originais estão no STASH da entry~~
      * (sub rsp,16 antes dos pushes): kframe[15]=RIP, kframe[16]=RFLAGS~
@@ -779,6 +1096,12 @@ int proc_fork(uint64_t *parent_kframe) {
     p->kernel_rsp = (uint64_t)sp;
     p->user_rsp = user_rsp_now;
     p->user_rip = parent_kframe[15];
+    p->s_rbx = parent_kframe[9];
+    p->s_rbp = parent_kframe[10];
+    p->s_r12 = parent_kframe[11];
+    p->s_r13 = parent_kframe[12];
+    p->s_r14 = parent_kframe[13];
+    p->s_r15 = parent_kframe[14];
 
     {
         uint64_t *f = (uint64_t *)p->kernel_rsp;
@@ -881,16 +1204,23 @@ int proc_clone_thread(uint64_t flags, uint64_t newsp,
      * quando a CPU der iretq, ele roda lá~ */
     uint64_t *sp = (uint64_t *)p->rsp0;
     sp -= 20;
-    for (int q = 0; q < 15; q++) sp[q] = parent_kframe[q];
+    for (int q = 0; q < 15; q++) sp[q] = parent_kframe[14 - q];
     sp[14] = 0;                          /* RAX=0: filho "retorna" 0 */
     sp[15] = parent_kframe[15];          /* RIP de retorno (stash)   */
     sp[16] = 0x1B;                       /* CS ring3                 */
     sp[17] = parent_kframe[16];          /* RFLAGS (stash)           */
-    sp[18] = newsp ? newsp : parent_kframe[18];
+    extern uint64_t current_rsp0;
+    sp[18] = newsp ? newsp : current_rsp0;
     sp[19] = 0x23;                       /* SS                       */
     p->kernel_rsp = (uint64_t)sp;
     p->user_rsp = sp[18];
     p->user_rip = sp[15];
+    p->s_rbx = parent_kframe[9];
+    p->s_rbp = parent_kframe[10];
+    p->s_r12 = parent_kframe[11];
+    p->s_r13 = parent_kframe[12];
+    p->s_r14 = parent_kframe[13];
+    p->s_r15 = parent_kframe[14];
 
     serial_puts("[clone] tid=");
     serial_puthex((uint32_t)p->pid);
@@ -919,6 +1249,23 @@ void proc_thread_exit(int code) {
     me->state = PROC_EMPTY;              /* sem zombie: join é por futex */
     schedule();
     for (;;) __asm__ volatile("hlt");
+}
+/* ~~ mata threads irmãs (mesmo espaço) silenciosamente ~~
+ * Morte fatal (exit/exit_group/sinal) mata o GRUPO (POSIX): threads
+ * irmãs viram EMPTY (join acorda via clear_tid zerado + timeout do
+ * futex). FASE5: sem isso, thread órfã de um main morto era
+ * re-escalonada com a pilha/memória liberadas (#GP no switch). */
+void proc_kill_siblings(pcb_t *me) {
+    if (!me) return;
+    for (int i = 0; i < MAX_PROC; i++) {
+        if (pcb_table[i].state != PROC_EMPTY &&
+            pcb_table[i].pid != me->pid &&
+            pcb_table[i].pml4 == me->pml4) {
+            if (pcb_table[i].clear_tid)
+                *pcb_table[i].clear_tid = 0;
+            pcb_table[i].state = PROC_EMPTY;
+        }
+    }
 }
 /* ♥ fim clone/threads ♥ */
 

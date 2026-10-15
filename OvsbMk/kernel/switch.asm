@@ -76,13 +76,7 @@ context_switch_kern:
     ; do fluxo C (wait4/read pipe). Salva o RSP apontando pro PRÓPRIO
     ; return address — o `ret` final devolve o controle pro caller
     ; (schedule) exatamente onde parou! kyun~
-    mov dx, 0x3F8
-    mov al, '<'
-    out dx, al
-    mov al, 'K'
-    out dx, al
-    mov al, '>'
-    out dx, al
+    ; DEBUG K removed
     mov [rdi + KRNL_RSP], rsp
     mov dword [rdi + IN_KERN], 1
     mov [rdi + S_RBX], rbx
@@ -91,21 +85,29 @@ context_switch_kern:
     mov [rdi + S_R13], r13
     mov [rdi + S_R14], r14
     mov [rdi + S_R15], r15
+    mov ecx, 0xC0000100
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    mov [rdi + FS_BASE], rax
 
     ; ~~ restore: depende de COMO o next foi salvo!~~
     cmp dword [rsi + IN_KERN], 0
     jne .do_resume_kern
 
     ; ---- next salvo em MODO USUÁRIO: caminho clássico ----
-    mov dx, 0x3F8
-    mov al, 'N'
-    out dx, al
+    ; DEBUG N removed
     mov rsp, [rsi + KRNL_RSP]
     mov rax, [rsi + PML4]
     mov cr3, rax
     mov rax, [rsi + RSP0]
     mov [tss + 4], rax
     mov [current_rsp0], rax
+    mov rax, [rsi + FS_BASE]
+    mov rcx, 0xC0000100
+    mov rdx, rax
+    shr rdx, 32
+    wrmsr
     mov rbx, [rsi + S_RBX]
     mov rbp, [rsi + S_RBP]
     mov r12, [rsi + S_R12]
@@ -136,13 +138,7 @@ context_switch_kern:
 
 .do_resume_kern:
 .restore_in_kern:
-    mov dx, 0x3F8
-    mov al, '<'
-    out dx, al
-    mov al, 'R'
-    out dx, al
-    mov al, '>'
-    out dx, al
+    ; DEBUG R removed
     ; ~~ restauração de processo em modo kernel (compartilhada!) ~~
     ; KRNL_RSP aponta pra stack de C válida (return address no topo)
     mov rsp, [rsi + KRNL_RSP]
@@ -151,6 +147,11 @@ context_switch_kern:
     mov rax, [rsi + RSP0]
     mov [tss + 4], rax
     mov [current_rsp0], rax
+    mov rax, [rsi + FS_BASE]
+    mov rcx, 0xC0000100
+    mov rdx, rax
+    shr rdx, 32
+    wrmsr
     mov rbx, [rsi + S_RBX]
     mov rbp, [rsi + S_RBP]
     mov r12, [rsi + S_R12]
@@ -158,13 +159,7 @@ context_switch_kern:
     mov r14, [rsi + S_R14]
     mov r15, [rsi + S_R15]
     mov dword [rsi + IN_KERN], 0
-    mov dx, 0x3F8
-    mov al, '<'
-    out dx, al
-    mov al, 'r'
-    out dx, al
-    mov al, '>'
-    out dx, al
+    ; DEBUG r removed
     ret                              ; continua o C do next!
 
 context_switch:
@@ -200,13 +195,7 @@ context_switch:
     cmp dword [rsi + IN_KERN], 0   ; ~~ próximo bloqueou EM SYSCALL?~~
     jne context_switch_kern.restore_in_kern   ; volta NO MEIO do fluxo C~
 
-    mov dx, 0x3F8
-    mov al, '<'
-    out dx, al
-    mov al, 'U'
-    out dx, al
-    mov al, '>'
-    out dx, al
+    ; DEBUG U removed
     mov rsp, [rsi + KRNL_RSP]      ; 1. Troca RSP pro kernel stack do next ~
     mov rax, [rsi + PML4]          ; 2. Troca page tables (CR3) ~
     mov cr3, rax                   ;    ATENÇÃO: endereços mudam! Mas kernel

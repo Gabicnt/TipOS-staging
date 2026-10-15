@@ -45,6 +45,15 @@ int atoi(const char *s) {
     return sign * n;
 }
 
+int abs(int value) {
+    return value < 0 ? -value : value;
+}
+
+int system(const char *command) {
+    (void)command;
+    return -1;
+}
+
 // ~~ itoa ~~
 // Converte int → string (buffer fornecido por quem chama~).
 // Lida com números negativos (prefixo '-'), gera dígitos ao contrário
@@ -63,8 +72,7 @@ char *itoa(int n, char *buf) {
 
 // ~~ Alocador de memória ~~
 // HEAP_SIZE = 64KB de heap estático embutido (suficiente pra programas pequenos~)
-// HDR_SZ = tamanho do header (sizeof unsigned long = 4 bytes)
-// Cada bloco livre/ocupado tem: [size | USED][next_pointer]
+// Cada bloco tem size/flags e o link da freelist antes do payload.
 // USED = bit 0 do size indica ocupado, AMASK = ~USED pra mascarar
 // NEXT(b) = ponteiro pro próximo bloco (armazenado após o header)
 // ALIGN8(n) = alinha pra 8 bytes (requisito de alinhamento da libc~)
@@ -73,10 +81,11 @@ char *itoa(int n, char *buf) {
 static char _heap[HEAP_SIZE];
 static int _hinit;
 
-#define HDR_SZ ((int)sizeof(unsigned long))
+#define SIZE_HDR_SZ ((int)sizeof(unsigned long))
+#define HDR_SZ (SIZE_HDR_SZ + (int)sizeof(void *))
 #define USED   1UL
 #define AMASK  (~USED)
-#define NEXT(b)  (*(void**)((char*)(b) + HDR_SZ))
+#define NEXT(b)  (*(void**)((char*)(b) + SIZE_HDR_SZ))
 #define ALIGN8(n) (((n) + 7) & ~7)
 #define MMAP_THRESH 2048
 
@@ -261,7 +270,7 @@ int munmap(void *addr, int length) {
 /* ~~ exit ~~ */
 /* ~ essa funcao aqui e a mais importante, presta atencao baka! */
 void exit(int code) {
-    _syscall(1, code, 0, 0, 0);
+    _syscall(60, code, 0, 0, 0);
     for (;;) __asm__("hlt");
 }
 

@@ -17,6 +17,7 @@
 #include "pit.h"
 #include "process.h"
 #include "serial.h"
+#include "signal.h"
 
 static inline void outb(uint16_t port, uint8_t val) { __asm__ volatile ("outb %0, %1" :: "a"(val), "Nd"(port)); }
 
@@ -25,9 +26,10 @@ volatile int need_sched = 0;
 
 /* ~~ Vai tratar esse evento~ se prepara pro caos! */
 /* ~ simples mas essencial, n mexe sem saber oq ta fazendo */
-void timer_tick_handler(void) {
+void timer_tick_handler(uint64_t *registers) {
     timer_ticks++;
     outb(0x20, 0x20);
+    signal_dispatch_irq(registers);
     /* ~~ Agenda FORA da interrupção: o kernel_main chama schedule()~
      * (trocar de contexto DENTRO do irq0 abandonava o frame e o
      *  kernel voltava com IF=0 / estado pela metade~ rssrsrs) */

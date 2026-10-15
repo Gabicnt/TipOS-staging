@@ -17,6 +17,7 @@
 // Nota: strtok usa estado global (static), não é thread-safe~ >_<
 
 #include <stdlib.h>
+#include <stddef.h>
 
 /* ~~ strlen ~~ */
 /* ~ essa demorou pra debugar, respeita ~ */
@@ -51,6 +52,34 @@ int strncmp(const char *a, const char *b, int n) {
         if (!a[i]) return 0;
     }
     return 0;
+}
+
+int strcasecmp(const char *a, const char *b) {
+    while (*a && *b) {
+        unsigned char ca = (unsigned char)*a++;
+        unsigned char cb = (unsigned char)*b++;
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca + ('a' - 'A'));
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb + ('a' - 'A'));
+        if (ca != cb) return ca - cb;
+    }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+
+int strncasecmp(const char *a, const char *b, size_t n) {
+    while (n-- && *a && *b) {
+        unsigned char ca = (unsigned char)*a++;
+        unsigned char cb = (unsigned char)*b++;
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca + ('a' - 'A'));
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb + ('a' - 'A'));
+        if (ca != cb) return ca - cb;
+    }
+    if (n == (size_t)-1) return 0;
+    return (unsigned char)*a - (unsigned char)*b;
+}
+
+void bzero(void *s, size_t n) {
+    unsigned char *bytes = s;
+    while (n--) *bytes++ = 0;
 }
 
 // ~~ strcpy ~~

@@ -1,20 +1,51 @@
-# moe moe kyun <3
-# Nossa listinha de arquivos que o git ignora, pra n sujar o repo com artefatos de build
+# === Build artifacts ===
 build/
-*.iso
+build-*/
 *.o
 *.elf
+*.iso
 *.bin
-*.rlib
-*.rmeta
-*.a
-target/
-*.tmp
-*.bak
-*.swp
-*.swo
-temp.*
-*.log
-.DS_Store
+
+# === Discos e imagens ===
 disk.img
-/iso/
+disk.img.*
+*.img
+*.vhd
+*.qcow2
+
+# === Staging temporário ===
+.x11-phase5.*
+*.before
+*.original
+*.bak
+*.bak_*
+
+# === Logs e debug ===
+*.log
+tmp/
+/tmp/
+
+# === Ferramentas / IDEs ===
+.claude/
+.freebuff/
+.cursor/
+.vscode/
+.idea/
+*.swp
+*~
+
+# === Repos embutidos ===
+DOT/
+
+# === ISO staging ===
+OvsbMk/iso/
+
+# === Docs geradas (binárias) ===
+docs/*.png
+docs/*.pdf
+
+# === ovsb.term ===
+ovsb-term/ovsb.term
+ovsb-term/tests/test_grid
+ovsb-term/tests/test_escape
+ovsb-term/tests/test_scrollback

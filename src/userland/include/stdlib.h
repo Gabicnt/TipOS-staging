@@ -17,6 +17,9 @@
 
 // ── Conversão de strings ───────────────────────────────────
 int atoi(const char *s);            // String → int ("42" vira 42, óbvio~)
+int abs(int value);
+double atof(const char *s);
+int system(const char *command);
 char *itoa(int n, char *buf);       // Int → string (o contrário do atoi~)
 
 // ── Alocação de memória ────────────────────────────────────

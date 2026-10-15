@@ -119,13 +119,11 @@ void kmain(uint32_t magic, uint32_t mb_info) {
             char key = keyboard_read();
             shell_input(key);
         }
-        /* polling do mouse (fallback caso IRQ não dispare) */
-        uint8_t ps2_status = inb(0x64);
-        if (ps2_status & 0x01) {
-            uint8_t d = inb(0x60);
-            if (ps2_status & 0x20)
-                mouse_process_byte(d);
-        }
+        /* polling legado do mouse removido: o inb(0x60) aqui competia
+         * com a IRQ12 e roubava bytes do stream, desalinhando pacotes de
+         * 3 bytes (flags sem bit 0x08). O handler IRQ ja consome via
+         * mouse_handler() -> mouse_process_byte() + mice_push(). */
+        // (polling desabilitado — ver mouse_handler IRQ12)
         usb_poll();
         /* ~~ Yield pro scheduler!~~ Sem isso processo em background
          * ("exec XORG &") nunca rodava: o irq0 so preempta quem ta

@@ -58,7 +58,13 @@ struct vmspace {
 
 vm_object_t *vm_object_create(size_t size);
 vm_object_t *vm_object_share(vm_object_t *obj);
+vm_object_t *vm_object_alias(vm_object_t *obj);
+vm_object_t *vm_object_unalias(vm_object_t *obj);
 void vm_object_destroy(vm_object_t *obj);
+/* FASE5: solta 1 página com guarda (1 = liberou o frame) */
+int vm_object_release_page(vm_object_t *obj, size_t pg);
+/* FASE5: registra posse de frame instalado fora do obj_get_page */
+void objref_claim(uint64_t pa);
 
 void vm_map_init(vm_map_t *map, uint64_t min, uint64_t max);
 int  vm_map_covers(void *map, uint64_t va);

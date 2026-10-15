@@ -21,6 +21,9 @@ void console_set_fg(uint32_t color);
 void console_set_bg(uint32_t color);
 void console_set_output_buffer(char *buf, int *len, int max);
 
+/* 1 = console desenha no fbdev (VESA); 0 = só serial (Xorg dono do fb) */
+extern int g_console_fbdev_enabled;
+
 #endif
 
 /* ♥ console.h ~ arquivo fofinho do OvsbMkM! kyun~ <3 */

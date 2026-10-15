@@ -24,10 +24,10 @@ LDFLAGS := -nostdlib -no-pie -Wl,-nostdlib -T kernel/linker.ld
 BUILD_DIR := build
 
 # ♥ VPATH: procura sources em kernel, drivers, libs, e fs~
-VPATH := kernel:drivers:lib/gui:lib/owt:lib/wm:fs
+VPATH := kernel:kernel/drivers:drivers:lib/gui:lib/owt:lib/wm:fs
 
 # ♥ C_SRCS: todos .c (keyboard/mouse em Zig, não em C)
-C_SRCS := $(notdir $(wildcard kernel/*.c drivers/*.c lib/gui/*.c lib/owt/*.c lib/wm/*.c fs/*.c))
+C_SRCS := $(notdir $(wildcard kernel/*.c kernel/drivers/*.c drivers/*.c lib/gui/*.c lib/owt/*.c lib/wm/*.c fs/*.c))
 # ♥ ASM_SRCS: boot, IDT assembly, keyboard asm, context switch, syscall entry
 ASM_SRCS := boot64.o idt_asm.o keyboard_asm.o switch_asm.o syscall_entry.o
 # ♥ ZIG_SRCS: syscall handler, ELF loader, ext2, initramfs
@@ -93,10 +93,10 @@ $(BUILD_DIR)/initramfs.o: fs/initramfs.zig | $(BUILD_DIR)
 
 # ♥ Regra genérica: compila .c → .o (com includes nos diretórios)
 $(BUILD_DIR)/%.o: %.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I. -Ikernel -Idrivers -Ilib/gui -Ilib/owt -Ilib/wm -Ifs -c -o $@ $<
+	$(CC) $(CFLAGS) -I. -Ikernel -Ikernel/drivers -Idrivers -Ilib/gui -Ilib/owt -Ilib/wm -Ifs -c -o $@ $<
 
 # ♥ Link final: junta todos os .o no kernel.elf
-$(BUILD_DIR)/kernel.elf: $(OBJS)
+$(BUILD_DIR)/kernel.elf: $(OBJS) kernel/linker.ld
 	$(CC) $(CFLAGS) $(OBJS) -o $@ $(LDFLAGS)
 
 # ♥ iso: gera ISO bootável com GRUB~
@@ -155,4 +155,107 @@ OvsbMkM.iso: $(BUILD_DIR)/kernel.elf
 	cp $(BUILD_DIR)/kernel.elf iso/boot/
 	grub-mkrescue -o OvsbMkM.iso iso 2>/dev/null || true
 
-.PHONY: all clean run iso
+$(BUILD_DIR)/PTY_TEST: $(TESTS_DIR)/pty_test.c | $(BUILD_DIR)
+	$(CC) -static -O2 -Wall -Wextra -o $@ $<
+
+build-pty-test: $(BUILD_DIR)/PTY_TEST
+	@test -f ../disk.img
+	@mcopy -o -i ../disk.img $(BUILD_DIR)/PTY_TEST ::/BIN/PTY_TEST
+
+$(BUILD_DIR)/SIGNAL_TEST: $(TESTS_DIR)/signal_test.c | $(BUILD_DIR)
+	$(CC) -static -O2 -Wall -o $@ $<
+
+$(BUILD_DIR)/SIGCHLD_TEST: $(TESTS_DIR)/sigchld_test.c | $(BUILD_DIR)
+	$(CC) -static -O2 -Wall -o $@ $<
+
+$(BUILD_DIR)/SIGWINCH_TEST: $(TESTS_DIR)/sigwinch_test.c | $(BUILD_DIR)
+	$(CC) -static -O2 -Wall -o $@ $<
+
+build-signal-test: $(BUILD_DIR)/SIGNAL_TEST
+	mcopy -o -i ../disk.img $(BUILD_DIR)/SIGNAL_TEST ::/BIN/SIGNAL_TEST
+
+build-sigchld-test: $(BUILD_DIR)/SIGCHLD_TEST
+	mcopy -o -i ../disk.img $(BUILD_DIR)/SIGCHLD_TEST ::/BIN/SIGCHLD_TEST
+
+build-sigwinch-test: $(BUILD_DIR)/SIGWINCH_TEST
+	mcopy -o -i ../disk.img $(BUILD_DIR)/SIGWINCH_TEST ::/BIN/SIGWINCH_TEST
+
+build-signal-tests: build-signal-test build-sigchld-test build-sigwinch-test
+
+# ♥ FASE 4: ELF dinâmico (libtest.so + DYN_TEST)
+$(BUILD_DIR)/libtest.so: $(TESTS_DIR)/libtest.c | $(BUILD_DIR)
+	gcc -shared -fPIC -nostdlib -Wl,--hash-style=sysv -o $@ $<
+
+$(BUILD_DIR)/DYN_TEST: $(TESTS_DIR)/dyn_test.c $(BUILD_DIR)/libtest.so | $(BUILD_DIR)
+	gcc -pie -nostdlib -fPIC -Wl,--hash-style=sysv -Wl,-rpath,/lib \
+		-Wl,--dynamic-linker=/lib/ld.so -o $@ $< -L$(BUILD_DIR) -ltest
+
+build-dyn-test: $(BUILD_DIR)/DYN_TEST $(BUILD_DIR)/libtest.so
+	-mmd -i ../disk.img ::/LIB 2>/dev/null || true
+	mcopy -o -i ../disk.img $(BUILD_DIR)/libtest.so ::/LIB/libtest.so
+	mcopy -o -i ../disk.img $(BUILD_DIR)/DYN_TEST ::/BIN/DYN_TEST
+
+.PHONY: all clean run iso build-pty-test build-signal-test build-sigchld-test build-sigwinch-test build-signal-tests build-dyn-test build-wayland-lib build-layer-shell-test build-ovsb-desktop
+$(BUILD_DIR)/FB_EVDEV_TEST: $(TESTS_DIR)/fb_evdev_test.c | $(BUILD_DIR)
+	$(CC) -static -O2 -Wall -o $@ $<
+
+build-fb-evdev-test: $(BUILD_DIR)/FB_EVDEV_TEST
+	mcopy -o -i ../disk.img $(BUILD_DIR)/FB_EVDEV_TEST ::/BIN/FB_EVDEV_TEST
+
+$(BUILD_DIR)/WAYLAND_COMPOSITOR: $(TESTS_DIR)/wayland_compositor.c | $(BUILD_DIR)
+	$(CC) -static -O2 -Wall -o $@ $<
+
+$(BUILD_DIR)/WAYLAND_CLIENT: $(TESTS_DIR)/wayland_client.c | $(BUILD_DIR)
+	$(CC) -static -O2 -Wall -o $@ $<
+
+$(BUILD_DIR)/WAYLAND_COMPOSITOR_SHM: $(TESTS_DIR)/wayland_compositor_shm.c | $(BUILD_DIR)
+	$(CC) -static -O2 -Wall -o $@ $<
+
+$(BUILD_DIR)/WAYLAND_SHM_CLIENT: $(TESTS_DIR)/wayland_shm_client.c | $(BUILD_DIR)
+	$(CC) -static -O2 -Wall -o $@ $<
+
+build-wayland: $(BUILD_DIR)/WAYLAND_COMPOSITOR $(BUILD_DIR)/WAYLAND_CLIENT $(BUILD_DIR)/WAYLAND_COMPOSITOR_SHM $(BUILD_DIR)/WAYLAND_SHM_CLIENT
+	mcopy -o -i ../disk.img $(BUILD_DIR)/WAYLAND_COMPOSITOR ::/BIN/WAYLAND_COMPOSITOR
+	mcopy -o -i ../disk.img $(BUILD_DIR)/WAYLAND_CLIENT ::/BIN/WAYLAND_CLIENT
+	mcopy -o -i ../disk.img $(BUILD_DIR)/WAYLAND_COMPOSITOR_SHM ::/BIN/WAYLAND_COMPOSITOR_SHM
+	mcopy -o -i ../disk.img $(BUILD_DIR)/WAYLAND_SHM_CLIENT ::/BIN/WAYLAND_SHM_CLIENT
+
+# ♥ FASE 7: compositor lib (libwayland-server + xdg_shell, static).
+# Receita reconstruída na Fase 7 (antes era comando manual perdido).
+# WL_DIR aponta p/ ../wl-build (libs estáticas sem SIMD).
+WL_DIR := ../wl-build
+$(BUILD_DIR)/WAYLAND_COMPOSITOR_LIB: $(TESTS_DIR)/compositor/wayland_compositor_lib.c $(TESTS_DIR)/compositor/xdg-shell-protocol.c $(TESTS_DIR)/compositor/us_keymap_bin.c | $(BUILD_DIR)
+	$(CC) -static -g -O2 -Wall -I $(TESTS_DIR)/compositor -I $(WL_DIR)/wayland/include -o $@ \
+		$(TESTS_DIR)/compositor/wayland_compositor_lib.c $(TESTS_DIR)/compositor/xdg-shell-protocol.c \
+		$(WL_DIR)/wayland/libwayland-server.a $(WL_DIR)/wayland/libwayland-private.a \
+		$(WL_DIR)/wayland/libwayland-util.a $(WL_DIR)/libffi/libffi.a \
+		-lrt -lpthread -ldl -lm
+
+build-wayland-lib: $(BUILD_DIR)/WAYLAND_COMPOSITOR_LIB
+	mcopy -o -i ../disk.img $(BUILD_DIR)/WAYLAND_COMPOSITOR_LIB ::/BIN/WAYLAND_COMPOSITOR_LIB
+
+# ♥ FASE 8.0a: teste do wlr-layer-shell (wallpaper + barra, protocolo raw)
+$(BUILD_DIR)/LAYER_SHELL_TEST: $(TESTS_DIR)/layer_shell_test.c | $(BUILD_DIR)
+	$(CC) -static -O2 -Wall -o $@ $<
+
+build-layer-shell-test: $(BUILD_DIR)/LAYER_SHELL_TEST
+	mcopy -o -i ../disk.img $(BUILD_DIR)/LAYER_SHELL_TEST ::/BIN/LAYER_SHELL_TEST
+
+# ♥ FASE 8.1: ovsb-desktop (wallpaper + barra + relógio, protocolo raw)
+$(BUILD_DIR)/OVSB-DESKTOP: $(TESTS_DIR)/desktop/ovsb-desktop.c | $(BUILD_DIR)
+	$(CC) -static -O2 -Wall -o $@ $<
+
+build-ovsb-desktop: $(BUILD_DIR)/OVSB-DESKTOP
+	mcopy -o -i ../disk.img $(BUILD_DIR)/OVSB-DESKTOP ::/BIN/OVSB-DESKTOP
+
+$(BUILD_DIR)/MEMFD_TEST: $(TESTS_DIR)/memfd_test.c | $(BUILD_DIR)
+	gcc -static -O2 -Wall -fno-stack-protector -U_FORTIFY_SOURCE -o $@ $<
+
+build-memfd-test: $(BUILD_DIR)/MEMFD_TEST 
+$(BUILD_DIR)/MEMFD_SIMPLE: $(TESTS_DIR)/memfd_simple.c | $(BUILD_DIR)
+	$(CC) -static -O2 -Wall -fno-stack-protector -U_FORTIFY_SOURCE -o $@ $<
+
+build-memfd-simple: $(BUILD_DIR)/MEMFD_SIMPLE
+	mcopy -o -i ../disk.img $(BUILD_DIR)/MEMFD_SIMPLE ::/BIN/MEMFD_SIMPLE
+	mcopy -o -i ../disk.img $(BUILD_DIR)/MEMFD_TEST ::/BIN/MEMFD_TEST
+

@@ -10,9 +10,11 @@
 #ifndef PROCESS_H
 #define PROCESS_H
 #include <stdint.h>
+#include "signal.h"
 
 struct vm_map;
 struct vmspace;
+struct tty;
 
 /* ♥ PROCESS ~ Gerenciamento de processos fofinho!
  * Dica: PCB = Process Control Block~ salva tudo do processo!
@@ -63,6 +65,12 @@ typedef struct pcb {
                                   thread (processo de verdade)~~ */
     volatile long *clear_tid; /* ~~ CLONE_CHILD_CLEARTID: zera + acorda o
                                   joiner no exit da thread~~ */
+    struct tty *controlling_tty;
+    tipos_sigaction_t actions[64];
+    uint64_t blocked;
+    uint64_t pending;
+    int pgrp;
+    int session;
 } pcb_t;
 
 extern pcb_t pcb_table[MAX_PROC];
@@ -91,18 +99,19 @@ int proc_fork(uint64_t *parent_kframe);
 int proc_clone_thread(uint64_t flags, uint64_t newsp, uint64_t ptid,
                       uint64_t ctid, uint64_t tls, uint64_t *parent_kframe);
 void proc_thread_exit(int code);
+void proc_kill_siblings(pcb_t *me);
 
 void context_switch(pcb_t *current, pcb_t *next);
 
 /* ~~ setup_linux_user_stack ~~
  * Monta a pilha Linux pro usuario! argc, argv, envp, auxv~
  * Tudo que o musl precisa pra nao reclamar da vida~
- * Recebe o topo da pilha e devolve o novo RSP~ */
-uint64_t setup_linux_user_stack(pcb_t *pcb, uint64_t user_stack_top,
-                                 uint64_t phdr, uint64_t phent, uint64_t phnum,
-                                 uint64_t elf_base,
-                                 char **argv, int argc,
-                                 char **envp, int envc);
+ * Recebe o topo da pilha e devolve o novo RSP~ */uint64_t setup_linux_user_stack(pcb_t *pcb, uint64_t user_stack_top,
+                                uint64_t phdr, uint64_t phent, uint64_t phnum,
+                                uint64_t elf_base,
+                                char **argv, int argc,
+                                char **envp, int envc,
+                                uint64_t at_entry);
 uint64_t setup_linux_user_stack_dyn(pcb_t *pcb, uint64_t user_stack_top,
                                     uint64_t phdr, uint64_t phent, uint64_t phnum,
                                     uint64_t elf_base, char **argv, int argc,

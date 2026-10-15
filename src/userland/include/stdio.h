@@ -25,11 +25,12 @@
 #define SEEK_SET 0  // início do arquivo
 #define SEEK_CUR 1  // posição atual
 #define SEEK_END 2  // final do arquivo
+#define EOF (-1)
 
 // ~~ FILE ~~
 // Estrutura simples: só o file descriptor por enquanto.
 // Sem buffer, sem mutex, sem frescura~ (libc minimalista, sabe como é~)
-typedef struct { int fd; } FILE;
+typedef struct { int fd; int eof; int in_use; } FILE;
 
 extern FILE __stdin_file;
 extern FILE __stdout_file;
@@ -40,13 +41,15 @@ extern FILE __stderr_file;
 #define stderr (&__stderr_file)
 
 // ── Operações de arquivo (syscall) ─────────────────────────
-int open(const char *path, int flags);   // Abre arquivo (retorna fd ou -1)
+int open(const char *path, int flags, ...);   // Abre arquivo (retorna fd ou -1)
 int close(int fd);                       // Fecha fd (não esquece, senão vaza~)
 int read(int fd, void *buf, int count);  // Lê `count` bytes pro buffer
 int write(int fd, const void *buf, int count); // Escreve `count` bytes do buffer
 int lseek(int fd, int offset, int whence); // Reposiciona offset da leitura/escrita
 int unlink(const char *path);            // Remove arquivo (não vai pra lixeira~)
-int mkdir(const char *path);             // Cria diretório (vazio, obviamente~)
+int remove(const char *path);
+int rename(const char *old_path, const char *new_path);
+int mkdir(const char *path, int mode);   // Cria diretório (vazio, obviamente~)
 int rmdir(const char *path);             // Remove diretório (só vazio, chato~)
 
 // ── E/S de caracteres ──────────────────────────────────────
@@ -54,6 +57,7 @@ void putchar(char c);                    // Escreve um caractere no stdout
 void puts(const char *s);               // Escreve string + \n no stdout
 int printf(const char *fmt, ...);       // Printf formatado (sim, tem %d, %s, etc~)
 int vsnprintf(char *buf, int n, const char *fmt, va_list ap); // Formata em buffer (seguro~)
+int snprintf(char *buf, unsigned long n, const char *fmt, ...);
 int sprintf(char *buf, const char *fmt, ...);  // Formata em buffer (perigoso~)
 int sscanf(const char *s, const char *fmt, ...);  // Parseia string formatada
 char getchar(void);                      // Lê um caractere do stdin (bloqueante~)
@@ -63,11 +67,17 @@ char *fgets(char *buf, int n, FILE *f);  // Lê linha de um FILE (limitado~)
 // ── E/S arquivada (FILE*) ──────────────────────────────────
 FILE *fopen(const char *path, const char *mode);  // Abre arquivo (retorna FILE*)
 int fclose(FILE *f);                      // Fecha arquivo (libera FILE*)
-int fread(void *buf, int size, int count, FILE *f);  // Lê blocos do arquivo
-int fwrite(const void *buf, int size, int count, FILE *f);  // Escreve blocos
+int fread(void *buf, unsigned long size, unsigned long count, FILE *f);  // Lê blocos do arquivo
+int fwrite(const void *buf, unsigned long size, unsigned long count, FILE *f);  // Escreve blocos
+int fseek(FILE *f, long offset, int whence);
+long ftell(FILE *f);
+int feof(FILE *f);
 int fputs(const char *s, FILE *f);        // Escreve string no arquivo
 int fputc(int c, FILE *f);                // Escreve caractere no arquivo
 int fprintf(FILE *f, const char *fmt, ...);  // Printf formatado em arquivo
+int vfprintf(FILE *f, const char *fmt, va_list ap);
+int fscanf(FILE *f, const char *fmt, ...);
+int fflush(FILE *f);
 
 // ── Utilitários ────────────────────────────────────────────
 int kbhit(void);                         // Verifica se tem tecla disponível

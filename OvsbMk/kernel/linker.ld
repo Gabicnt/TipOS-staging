@@ -8,7 +8,7 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 1M;
+    . = 0x08000000;
     
     .multiboot : {
         KEEP(*(.multiboot))
@@ -31,8 +31,11 @@ SECTIONS
     }
     
     .bss : {
+        __bss_start = .;
         *(.bss)
+        *(.bss.*)
         *(COMMON)
+        __bss_end = .;
     }
 }
 
